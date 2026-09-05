@@ -273,6 +273,11 @@ class ProjectStore:
             previous = peq.get("replaces_peq_id", "")
             if not isinstance(previous, str) or (previous and (previous not in peq_ids or previous == peq["id"])):
                 raise ValueError("PEQ 的前一版本參照無效。")
+            extension = peq.get("extension_source_id")
+            if extension is not None and (not isinstance(extension, str) or extension not in peq_ids or extension == peq["id"]):
+                raise ValueError("PEQ 的保留擴充來源無效。")
+            if peq.get("deleted_at") is not None and not isinstance(peq["deleted_at"], str):
+                raise ValueError("PEQ 的回收區紀錄無效。")
             filters = peq.get("filters")
             if not isinstance(filters, dict) or not filters or not set(filters).issubset({"Shared", "L", "R"}) or ("Shared" in filters and len(filters) != 1):
                 raise ValueError("PEQ 的聲道濾波器設定無效。")

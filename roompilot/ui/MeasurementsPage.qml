@@ -124,7 +124,7 @@ ScrollView {
                                 Text { text: selected.name || "選取一筆量測"; Layout.fillWidth: true; elide: Text.ElideRight; color: "#e2edf4"; font.pixelSize: 16; font.weight: Font.DemiBold }
                                 RPCheckBox { text: "低頻檢視"; checked: true; onCheckedChanged: measurementChart.lowOnly = checked }
                             }
-                            FrequencyChart { id: measurementChart; objectName: "measurementChart"; Layout.fillWidth: true; Layout.preferredHeight: 270; lowOnly: true; curves: (s.chart || {}).curves || []; frequencyMin: (s.chart || {}).f_min || 20; frequencyMax: (s.chart || {}).f_max || 20000 }
+                            FrequencyChart { id: measurementChart; objectName: "measurementChart"; Layout.fillWidth: true; Layout.preferredHeight: 312; lowOnly: true; curves: (s.chart || {}).curves || []; frequencyMin: (s.chart || {}).f_min || 20; frequencyMax: (s.chart || {}).f_max || 20000 }
                         }
                     }
                     RPCard {
@@ -252,9 +252,9 @@ ScrollView {
         contentItem: ColumnLayout {
             spacing: 17
             SectionTitle { title: "確認這組 Baseline"; subtitle: "將目前勾選的 " + page.chosenIds.length + " 筆量測保存為新的基準版本。"; Layout.fillWidth: true }
-            Text { text: "請先查看右側品質報告，確認麥克風 Cal、獨立 L/R、位置與播放條件。若出現缺少 Cal、左右差異或資料不足，處理後再建立基準會更可靠。"; color: "#a2b9ca"; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap; lineHeight: 1.5 }
-            RPCheckBox { id: acknowledge; objectName: "acknowledgeBaselineWarnings"; text: "我已檢視提醒，了解未能確認的項目，仍要使用這組量測。"; Layout.fillWidth: true }
-            Text { text: "有重大錯誤的資料仍需先修正；確認提醒不會將未知項目改成已通過。"; color: "#7994a9"; font.pixelSize: 10; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            Text { text: "請查看品質報告，核對 Cal、聲道、位置與播放條件。可以匯入另一台電腦錄製的量測，本機裝置不必相同。設定記錄不完整或出現提醒時，可選擇略過後繼續。"; color: "#a2b9ca"; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap; lineHeight: 1.5 }
+            RPCheckBox { id: acknowledge; objectName: "acknowledgeBaselineWarnings"; text: "略過設定與品質提醒，仍使用這組量測。"; Layout.fillWidth: true }
+            Text { text: "提醒與略過決定會保留；未知項目不會改為已通過。無效數據、頻段不足或缺少必要量測仍需處理。"; color: "#7994a9"; font.pixelSize: 10; Layout.fillWidth: true; wrapMode: Text.WordWrap }
             RowLayout {
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }

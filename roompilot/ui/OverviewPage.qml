@@ -171,7 +171,7 @@ ScrollView {
                                 enabled: app.hasProject && count > 0
                                 onActivated: function(index) { bridge.updateSettings(JSON.stringify({output_device:model[index]})); }
                             }
-                            Text { text: "偵測到的名稱不代表 REW 當時使用的裝置；匯入後會另外顯示檔案記錄。"; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: "#6f899f"; font.pixelSize: 10; lineHeight: 1.4 }
+                            Text { text: "這是本機裝置的選填備註，可匯入另一台電腦錄製的檔案。偵測結果不代表當時的 REW 設定；量測記錄會另行顯示。"; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: "#6f899f"; font.pixelSize: 10; lineHeight: 1.4 }
                             Text { text: "PEQ 套用位置（選填）"; color: "#91a7bb"; font.pixelSize: 11; Layout.topMargin: 4 }
                             RPField { objectName: "dspLocation"; Layout.fillWidth: true; placeholderText: "例如：Roon / 系統 DSP / 硬體"; text: settings.peq_destination || ""; enabled: app.hasProject; onEditingFinished: bridge.updateSettings(JSON.stringify({peq_destination:text})) }
                         }

@@ -133,3 +133,76 @@ def test_cancelled_generation_does_not_create_version(bridge, app):
     await_work(bridge, app)
     assert bridge.project["peqs"] == []
     assert "取消" in bridge.state["message"]
+
+
+def test_trash_preserves_applied_history_and_bundle_references(bridge, app, tmp_path):
+    load_baseline(bridge)
+    bridge.generatePeq(json.dumps({"bands": 1, "mode": "standard", "target_level": 75}))
+    await_work(bridge, app)
+    first = bridge._peq()
+    bridge.markApplied(first["id"])
+    bridge.deletePeq(first["id"])
+    assert not bridge.state["peqs"]
+    assert not bridge.state["selected_peq"]
+    assert bridge.state["deleted_peqs"][0]["id"] == first["id"]
+    assert bridge.project["current_applied_peq_id"] == first["id"]
+    bridge.selectProject(bridge.project["id"])
+    assert not bridge.state["selected_peq"]
+    bundle = tmp_path / "trash.roompilot"
+    bridge.store.export_bundle(bridge.project, bundle)
+    imported = bridge.store.import_bundle(bundle)
+    assert imported["peqs"][0]["deleted_at"]
+    assert imported["current_applied_peq_id"] == first["id"]
+    bridge.restorePeq(first["id"])
+    assert bridge.state["selected_peq"]["status"] == "applied"
+    assert not bridge.state["deleted_peqs"]
+
+
+def test_gain_chart_sum_and_exact_generation_deduplicated(bridge, app):
+    load_baseline(bridge)
+    settings = json.dumps({"bands": 2, "mode": "standard", "target_level": 75})
+    bridge.generatePeq(settings)
+    await_work(bridge, app)
+    first_id = bridge._peq()["id"]
+    chart = bridge.state["peq_chart"]
+    assert chart["f_max"] >= 500
+    for channel in ("L", "R"):
+        total = next(c for c in chart["curves"] if c["kind"] == "peq_total" and c["channel"] == channel)
+        parts = [c["spl"] for c in chart["curves"] if c["kind"] == "per_band" and c["channel"] == channel]
+        np.testing.assert_allclose(total["spl"], np.sum(parts, axis=0), atol=1e-10)
+    bridge.generatePeq(settings)
+    await_work(bridge, app)
+    assert len(bridge.project["peqs"]) == 1
+    assert bridge._peq()["id"] == first_id
+
+
+def test_clipping_warning_can_be_acknowledged_but_data_errors_cannot(bridge):
+    bridge.project["measurements"] = measurements()
+    bridge.project["measurements"][0]["metadata"]["clipping"] = True
+    ids = json.dumps([m["id"] for m in bridge.project["measurements"]])
+    bridge.setBaseline(ids, False)
+    assert not bridge.state["baseline_ready"]
+    bridge.setBaseline(ids, True)
+    assert bridge.state["baseline_ready"]
+    report = bridge._baseline()["quality"]
+    assert any(q["code"] == "clipping" and q["level"] == "warning" for q in report)
+    bridge.project["measurements"][0]["spl"][5] = float("nan")
+    bridge.setBaseline(ids, True)
+    assert bridge.project["baseline_version"] == 1
+    assert bridge.state["message_kind"] == "error"
+
+
+def test_repeated_extension_does_not_create_a_chain_of_identical_versions(bridge, app):
+    load_baseline(bridge)
+    settings = {"bands": 2, "mode": "standard", "target_level": 75}
+    bridge.generatePeq(json.dumps(settings))
+    await_work(bridge, app)
+    settings.update(strategy="extend_existing", f_max=500, allow_extended=True)
+    bridge.generatePeq(json.dumps(settings))
+    await_work(bridge, app)
+    first_extension = bridge._peq()["id"]
+    before = len(bridge.project["peqs"])
+    bridge.generatePeq(json.dumps(settings))
+    await_work(bridge, app)
+    assert len(bridge.project["peqs"]) == before
+    assert bridge._peq()["id"] == first_extension

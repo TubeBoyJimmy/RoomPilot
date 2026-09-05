@@ -73,7 +73,7 @@ ScrollView {
                         id:versionColumn
                         anchors.left:parent.left; anchors.right:parent.right; anchors.top:parent.top; anchors.margins:20
                         spacing:15
-                        SectionTitle { title:"PEQ 版本"; subtitle:"保留每次調整；點選方案查看參數與驗證。"; Layout.fillWidth:true }
+                        SectionTitle { title:"PEQ 版本"; subtitle:"查看參數與驗證；不需要的方案可移除，之後仍能復原。"; Layout.fillWidth:true }
                         EmptyState { visible:!(s.peqs || []).length; Layout.fillWidth:true; Layout.preferredHeight:230; symbol:"≋"; title:"尚未建立 PEQ 方案"; subtitle:"完成第一輪建議後，每一版都會出現在這裡。" }
                         Repeater {
                             model:s.peqs || []
@@ -94,6 +94,28 @@ ScrollView {
                                         Text { text:app.formatTime(modelData.created_at); color:"#708da6"; font.pixelSize:10 }
                                     }
                                     RPButton { objectName:"openPeq_" + modelData.id; text:"查看 →"; compact:true; variant:"ghost"; onClicked:{bridge.selectPeq(modelData.id);app.go(2)} }
+                                    RPButton { objectName:"deletePeq_" + modelData.id; text:"移除"; compact:true; variant:"danger"; enabled:!s.busy; onClicked:{deleteDialog.peqId=modelData.id;deleteDialog.peqName=modelData.name || "PEQ";deleteDialog.open()} }
+                                }
+                            }
+                        }
+                        Rectangle { visible:(s.deleted_peqs || []).length > 0; Layout.fillWidth:true; height:1; color:"#2b4052"; Layout.topMargin:7 }
+                        SectionTitle { visible:(s.deleted_peqs || []).length > 0; title:"已移除的 PEQ"; subtitle:"方案資料與補錄關聯仍保留，可重新放回方案清單。"; Layout.fillWidth:true }
+                        Repeater {
+                            model:s.deleted_peqs || []
+                            delegate:Rectangle {
+                                required property var modelData
+                                Layout.fillWidth:true
+                                implicitHeight:deletedRow.implicitHeight + 24
+                                radius:8; color:"#101c2b"
+                                RowLayout {
+                                    id:deletedRow
+                                    anchors.left:parent.left; anchors.right:parent.right; anchors.top:parent.top; anchors.margins:12; spacing:10
+                                    ColumnLayout {
+                                        Layout.fillWidth:true; spacing:6
+                                        Text { text:modelData.name || "PEQ 方案"; color:"#9bb3c5"; font.pixelSize:12; Layout.fillWidth:true; wrapMode:Text.WordWrap }
+                                        Text { text:"移除於 " + app.formatTime(modelData.deleted_at || modelData.created_at); color:"#68849c"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap }
+                                    }
+                                    RPButton { objectName:"restorePeq_" + modelData.id; text:"復原"; compact:true; enabled:!s.busy; onClicked:bridge.restorePeq(modelData.id) }
                                 }
                             }
                         }
@@ -154,4 +176,5 @@ ScrollView {
         }
     }
     InspectDialog { id:snapshotDialog; objectName:"baselineSnapshotDialog" }
+    PeqDeleteDialog { id:deleteDialog; objectName:"historyPeqDeleteDialog" }
 }

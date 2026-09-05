@@ -92,7 +92,7 @@ def test_repeats_average_db_without_phase_or_level_normalization():
     result = generate_peq([left_a, left_b, right], dict(bands=1, target_level=75.))
     base = {c["channel"]: c for c in result["curves"] if c["kind"] == "baseline"}
     assert np.mean(np.array(base["L"]["spl"]) - base["R"]["spl"]) == pytest.approx(4.)
-    assert result["metrics"]["repeatability_db"] == pytest.approx(np.sqrt(2))
+    assert result["metrics"]["repeatability_db"] == pytest.approx(2.)
     assert result["target_level"] == 75
 
 
@@ -282,7 +282,7 @@ def test_manual_evaluation_preserves_evidence_metrics_and_disabled_band_order():
     result = evaluate_peq(ms, dict(bands=3), bands, target_level=75.)
     assert result["filters"] == bands == before
     assert result["metrics"]["manual_edit"] is True
-    assert result["metrics"]["repeatability_db"] == pytest.approx(np.sqrt(2) * .1)
+    assert result["metrics"]["repeatability_db"] == pytest.approx(.2)
     assert result["metrics"]["max_attenuation_db"] == pytest.approx(4., abs=.001)
     assert "L:P0" in result["metrics"]["channel_metrics"]
     assert result["target_level"] == 75.
@@ -301,10 +301,11 @@ def test_manual_boost_cannot_bypass_missing_positions_or_spatial_support():
         evaluate_peq(baseline, {"allow_boost": True}, {"L": [peak(gain=1, q=1)]}, 75.)
 
 
-def test_manual_cut_into_shared_opposite_null_and_overlapping_gain_rejected():
+def test_manual_cut_below_target_warns_and_overlapping_gain_rejected():
     ms = [measurement("L", [peak()]), measurement("R", [peak(gain=-8)])]
-    with pytest.raises(ValueError, match="深凹洞"):
-        evaluate_peq(ms, {"independent": False}, {"Shared": [peak(gain=-3)]}, 75.)
+    result = evaluate_peq(ms, {"independent": False}, {"Shared": [peak(gain=-3)]}, 75.)
+    assert result["filters"]["Shared"] == [peak(gain=-3)]
+    assert any("額外減益" in w for w in result["warnings"])
     with pytest.raises(ValueError, match="總 Gain"):
         evaluate_peq([measurement("L", [peak(gain=12)])], {"max_total_cut": 4}, {"L": [peak(gain=-3), peak(gain=-3)]}, 75.)
 

@@ -95,6 +95,7 @@ class Bridge(QObject):
         self._completion = None
         self._devices = {"inputs": [], "outputs": []}
         self._quality_cache = []
+        self._gain_chart_cache = {}
         self._closing = False
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(self.refreshDevices)
@@ -126,12 +127,39 @@ class Bridge(QObject):
         version = version or p.get("baseline_version")
         return next((b for b in p["baselines"] if b["version"] == version), None)
 
-    def _peq(self, peq_id=None):
+    def _active_peqs(self):
+        return [q for q in (self.project or {}).get("peqs", []) if not q.get("deleted_at")]
+
+    def _peq(self, peq_id=None, include_deleted=False):
         p = self._need_project()
         peq_id = peq_id or self._selected_peq_id
         result = next((item for item in p["peqs"] if item["id"] == peq_id), None)
-        if result is None:
+        if result is None or (result.get("deleted_at") and not include_deleted):
             raise ValueError("請先選擇一版 PEQ。")
+        return result
+
+    def _gain_chart(self, peq):
+        if not peq:
+            return {"curves": [], "f_min": 20, "f_max": 500}
+        settings = peq.get("settings", {})
+        fs = settings.get("sample_rate", 48000)
+        key = json.dumps([peq.get("filters", {}), fs, settings.get("f_max", 200)], sort_keys=True)
+        if key in self._gain_chart_cache:
+            return self._gain_chart_cache[key]
+        from .analysis import filter_response
+        hi = min(fs * .499, max(500, settings.get("f_max", 200) * 2.5))
+        grid = np.geomspace(20, hi, 1000)
+        curves = [{"name": "0 dB", "channel": "Shared", "kind": "zero", "frequency": grid.tolist(), "spl": [0.] * len(grid)}]
+        for channel, bands in peq.get("filters", {}).items():
+            curves.append(dict(name=f"{channel} 合成 PEQ", channel=channel, kind="peq_total", frequency=grid.tolist(), spl=filter_response(grid, bands, fs).tolist()))
+            for index, band in enumerate(bands):
+                if band.get("enabled", True):
+                    curves.append(dict(name=f"{channel} Band {index + 1} · {band['frequency']:g} Hz", channel=channel, kind="per_band", frequency=grid.tolist(), spl=filter_response(grid, [band], fs).tolist()))
+        result = {"curves": curves, "f_min": 20, "f_max": hi}
+        # Revisions are immutable. Bound memory when browsing many versions.
+        if len(self._gain_chart_cache) >= 8:
+            self._gain_chart_cache.pop(next(iter(self._gain_chart_cache)))
+        self._gain_chart_cache[key] = result
         return result
 
     def _quality(self, measurements):
@@ -163,7 +191,7 @@ class Bridge(QObject):
             if raw:
                 selected = self._summary(raw)
                 curves = [{"name": raw["name"], "channel": raw["channel"], "kind": "measurement", "frequency": raw["frequency"], "spl": raw["spl"]}]
-            peq = next((v for v in project["peqs"] if v["id"] == self._selected_peq_id), {})
+            peq = next((v for v in self._active_peqs() if v["id"] == self._selected_peq_id), {})
             if self._page == 2 and peq:
                 curves = (peq.get("verification") or {}).get("curves") or peq.get("curves", [])
             elif self._page == 0 and project.get("baseline_version"):
@@ -194,7 +222,8 @@ class Bridge(QObject):
             summary = {key: copy.deepcopy(snapshot.get(key)) for key in ("version", "created_at", "settings", "quality", "warnings_acknowledged")}
             summary["measurements"] = [self._summary(m) for m in snapshot["measurements"]]
             baseline_summaries.append(summary)
-        self._state = clean({"projects": self.store.list_projects(), "project": project_summary, "measurements": measurements, "selected_measurement": selected, "baselines": baseline_summaries, "peqs": [{k: q.get(k) for k in ("id", "name", "created_at", "status", "baseline_version")} for q in (project or {}).get("peqs", [])], "selected_peq": copy.deepcopy(peq), "quality": self._quality_cache, "history": (project or {}).get("history", []), "devices": self._devices, "busy": self._job is not None, "progress": self._progress, "message": self._message, "message_kind": self._message_kind, "page": self._page, "chart": {"curves": display_curves, "f_min": 20, "f_max": f_max}, "baseline_ready": bool(project and project.get("baseline_version"))})
+        summaries = lambda qs: [{k: q.get(k) for k in ("id", "name", "created_at", "status", "baseline_version", "deleted_at")} for q in qs]
+        self._state = clean({"projects": self.store.list_projects(), "project": project_summary, "measurements": measurements, "selected_measurement": selected, "baselines": baseline_summaries, "peqs": summaries(self._active_peqs()), "deleted_peqs": summaries([q for q in (project or {}).get("peqs", []) if q.get("deleted_at")]), "selected_peq": copy.deepcopy(peq), "quality": self._quality_cache, "history": (project or {}).get("history", []), "devices": self._devices, "busy": self._job is not None, "progress": self._progress, "message": self._message, "message_kind": self._message_kind, "page": self._page, "chart": {"curves": display_curves, "f_min": 20, "f_max": f_max}, "peq_chart": self._gain_chart(peq), "baseline_ready": bool(project and project.get("baseline_version"))})
         self.stateChanged.emit()
 
     @Slot(str, str)
@@ -215,7 +244,7 @@ class Bridge(QObject):
         self._not_busy()
         self.project = self.store.load(project_id)
         self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
-        self._selected_peq_id = self.project["peqs"][-1]["id"] if self.project["peqs"] else ""
+        self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
         self._quality_cache = self._quality(self.project["measurements"])
         self._message = ""
         self._page = 0
@@ -351,8 +380,9 @@ class Bridge(QObject):
                     m.setdefault("channel", "Unknown")
                     m.setdefault("position", "P0")
                     meta = m.setdefault("metadata", {})
-                    meta["session_conditions"] = conditions
-                    meta["conditions_source"] = "project_record"
+                    meta["project_notes_at_import"] = conditions
+                    # Analysis-host choices are notes, not evidence of recording
+                    # conditions. Preserve acquisition metadata from the source.
                     meta["source_file"] = Path(path).name
                     m["_import_path"] = str(Path(path).resolve())
                     imported.append(m)
@@ -442,17 +472,40 @@ class Bridge(QObject):
         if not baseline:
             raise ValueError("請先設定 Baseline。")
         settings = json.loads(payload)
+        if not isinstance(settings, dict):
+            raise ValueError("PEQ 設定格式錯誤。")
         measurements = copy.deepcopy(baseline["measurements"])
         version = baseline["version"]
         prior = p.get("current_applied_peq_id", "")
         settings["sample_rate"] = settings.get("sample_rate") or next((m["metadata"].get("sample_rate") for m in measurements if m["metadata"].get("sample_rate")), 48000)
+        base_peq = None
+        if settings.get("strategy") == "extend_existing":
+            base_peq = copy.deepcopy(self._peq())
+            if base_peq["baseline_version"] != version:
+                raise ValueError("保留擴充需要目前 Baseline 的 PEQ；請選擇相同 Baseline 版本的方案。")
 
         def run(progress, cancel):
             from .analysis import generate_peq
-            return generate_peq(measurements, settings, progress=progress, cancel=cancel)
+            return generate_peq(measurements, settings, progress=progress, cancel=cancel, base_peq=base_peq)
 
         def complete(result):
+            # Exact repeated computation does not need another durable revision.
+            def same_result(q):
+                return (q.get("baseline_version") == version and q.get("algorithm_version") == result.get("algorithm_version")
+                        and q.get("settings") == result.get("settings") and q.get("filters") == result.get("filters")
+                        and q.get("target_level") == result.get("target_level"))
+            # Repeatedly extending the selected result without changing anything
+            # is also a no-op: the selected source ID naturally changes once.
+            existing = base_peq if base_peq and same_result(base_peq) else next((q for q in reversed(self._active_peqs()) if same_result(q) and q.get("extension_source_id") == (base_peq or {}).get("id")), None)
+            if existing:
+                self._selected_peq_id = existing["id"]
+                self._message = f"結果與 {existing['name']} 完全相同，已選取原方案。"
+                self._message_kind = "info"
+                self._page = 2
+                self._refresh()
+                return
             result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft", baseline_version=version, replaces_peq_id=prior, verification={}, verification_history=[])
+            result["extension_source_id"] = (base_peq or {}).get("id")
             p["peqs"].append(result)
             p["settings"]["peq_settings"] = copy.deepcopy(result.get("settings", settings))
             self._selected_peq_id = result["id"]
@@ -464,9 +517,38 @@ class Bridge(QObject):
         self._start(run, complete, "正在比較低頻校正方案…")
 
     @Slot(str)
+    @guarded
     def selectPeq(self, peq_id):
+        self._peq(peq_id)
         self._selected_peq_id = peq_id
         self._refresh()
+
+    @Slot(str)
+    @guarded
+    def deletePeq(self, peq_id):
+        self._not_busy()
+        peq = self._peq(peq_id)
+        peq["deleted_at"] = timestamp()
+        if self._selected_peq_id == peq_id:
+            self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
+        self._message = f"{peq['name']} 已移至回收區，可在歷程還原。"
+        if self.project.get("current_applied_peq_id") == peq_id:
+            self._message += " 設備上的設定未改變，目前套用紀錄仍保留。"
+        self._message_kind = "info"
+        self._save("刪除 " + peq["name"], "移至可還原回收區，保留補錄及歷史關聯。")
+
+    @Slot(str)
+    @guarded
+    def restorePeq(self, peq_id):
+        self._not_busy()
+        peq = self._peq(peq_id, include_deleted=True)
+        if not peq.get("deleted_at"):
+            raise ValueError("此方案不在回收區。")
+        del peq["deleted_at"]
+        self._selected_peq_id = peq_id
+        self._message = f"{peq['name']} 已還原。"
+        self._message_kind = "success"
+        self._save("還原 " + peq["name"])
 
     @Slot(str, int, float, float, float, bool)
     @guarded
@@ -494,6 +576,8 @@ class Bridge(QObject):
         from .analysis import evaluate_peq
         baseline = self._baseline(original["baseline_version"])
         result = evaluate_peq(baseline["measurements"], settings, result["filters"], original["target_level"])
+        result["target_reference"] = copy.deepcopy(original.get("target_reference") or {"mode": "inherited", "level_db": original["target_level"], "statistic": "沿用舊版目標；原始估算參考未保存。"})
+        result["allocation"] = {"strategy": "manual", "skipped": ["手動調整後重新驗算，不宣稱原先的凍結 Band 或裙帶容差仍成立。"]}
         result["baseline_version"] = original["baseline_version"]
         result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft", replaces_peq_id=original["id"], verification={}, verification_history=[])
         result["rationale"].insert(0, "由 " + original["name"] + " 手動調整；參數表是完整替換設定。")
@@ -520,6 +604,14 @@ class Bridge(QObject):
     @Slot(str)
     @guarded
     def compareVerification(self, peq_id):
+        self._compare_verification(peq_id, False)
+
+    @Slot(str)
+    @guarded
+    def compareVerificationWithOverride(self, peq_id):
+        self._compare_verification(peq_id, True)
+
+    def _compare_verification(self, peq_id, allow_mismatch):
         self._not_busy()
         p = self._need_project()
         peq = self._peq(peq_id)
@@ -530,7 +622,8 @@ class Bridge(QObject):
         if not measurements:
             raise ValueError("這版 PEQ 還沒有補錄。請選擇「匯入補錄」。")
         from .analysis import compare_verification
-        result = clean(compare_verification(baseline["measurements"], measurements, peq))
+        result = clean(compare_verification(baseline["measurements"], measurements, peq, allow_mismatch=allow_mismatch))
+        result["mismatch_acknowledged"] = bool(allow_mismatch)
         result["created_at"] = timestamp()
         result["measurement_ids"] = [m["id"] for m in measurements]
         peq["verification"] = result
@@ -595,7 +688,7 @@ class Bridge(QObject):
         if path:
             self.project = self.store.import_bundle(path)
             self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
-            self._selected_peq_id = self.project["peqs"][-1]["id"] if self.project["peqs"] else ""
+            self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
             self._quality_cache = self._quality(self.project["measurements"])
             self._page = 0
             self._message = "已匯入獨立專案副本，所有版本已保留。"
