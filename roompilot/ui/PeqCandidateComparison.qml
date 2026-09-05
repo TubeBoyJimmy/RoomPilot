@@ -10,6 +10,7 @@ RPCard {
     property bool isPreview: false
     property bool savedGroup: !isPreview && savedVariants.length > 0
     property bool historical: !!comparison.historical && !savedGroup
+    property bool v5Policy:(preview.settings || {}).guard_policy === "v5"
     property var rows: savedGroup ? savedRows() : (comparison.candidates || [])
     property var chosen: selectedCandidate()
     function savedRows() {
@@ -40,11 +41,11 @@ RPCard {
     }
     function inspectNotes() {
         var currentModel=comparison.schema_version >= 2 || comparison.budget_fractions !== undefined;
-        var lines=[currentModel ? "三種策略使用相同目標與設備限制，分別在較小、中等及完整額外減益容許量內搜尋。延伸原案時，預算先包含原案已有的減益。三個標籤會一起保存在同一 PEQ 版本；有時不同預算仍得到相同參數。" : "這是先前模型產生的候選比較，保留當時的策略與門檻。", "你設定的總容許量：" + app.num(comparison.low_cut_limit_db,2) + " dB RMS", "判斷各位置 RMS 的最大值；不是每個頻點的最大衰減，也不是聲學標準。", "", "殘留波峰使用整個校正頻段；額外減益只統計原本低於目標的頻點。兩者分母不同，不可相加。", "預選是比較的起點，不代表最佳聽感或已獲實測驗證。"];
+        var lines=[currentModel ? "三種策略使用相同目標與設備限制，分別在較小、中等及完整原低處額外減益容許量內搜尋。延伸原案時，預算先包含原案已有的減益。三個標籤會一起保存在同一 PEQ 版本；有時不同預算仍得到相同參數。" : "這是先前模型產生的候選比較，保留當時的策略與門檻。", "你設定的原低處總容許量：" + app.num(comparison.low_cut_limit_db,2) + " dB RMS", v5Policy ? "v0.5 逐筆原始量測檢查低處，並共同限制所有頻點新增低處、滑動頻窗減益及固定 80–200 Hz 平均減益。" : "此舊政策判斷各位置平均曲線 RMS 的最大值，未宣告已通過 v0.5 校正保護。", "RMS 最大值不是單一頻點最大衰減。這些容許量是工程保護設定，不是聽覺閾值或設備能力。", "", "殘留波峰使用整個校正頻段；原低處額外減益只統計原本低於目標的頻點。兩者分母不同，不可相加。", "預選是比較的起點，不代表最佳聽感或已獲實測驗證。"];
         lines=lines.concat([""],comparison.notes || []);
         for(var i=0;i<rows.length;i++) {
             var c=rows[i];
-            lines.push("",c.title || c.key,purpose(c),"此候選容許量：" + app.num(c.low_cut_limit_db !== undefined ? c.low_cut_limit_db : comparison.low_cut_limit_db,2) + " dB RMS",c.within_limit ? "所有位置均在此候選容許量內" : "至少一個位置超過容許量");
+            lines.push("",c.title || c.key,purpose(c),"此候選原低處容許量：" + app.num(c.low_cut_limit_db !== undefined ? c.low_cut_limit_db : comparison.low_cut_limit_db,2) + " dB RMS",c.within_limit ? "此候選的容許量檢查通過；新增保護與涵蓋範圍另見目前方案的診斷。" : "此候選的容許量檢查未通過。");
             if(c.within_limit && c.pareto === false) lines.push("本輪另有合格候選在兩項主要指標均不差，且至少一項更好。");
             if(!c.within_limit) lines.push("未納入合格候選的取捨比較。");
             for(var j=0;j<(c.limit_violations || []).length;j++) { var v=c.limit_violations[j]; lines.push((v.id || v.channel + " · " + v.position) + "：" + app.num(v.value_db,2) + " dB RMS，門檻 " + app.num(v.limit_db,2)); }
@@ -88,7 +89,7 @@ RPCard {
             visible:!!panel.chosen.key
             Layout.fillWidth:true; spacing:12
             Text { text:"殘留波峰 " + panel.app.num((panel.chosen.metrics || {}).residual_peak_rms_db,2) + " dB RMS"; color:"#b8d4e1"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
-            Text { text:"低處額外減益 " + panel.app.num((panel.chosen.metrics || {}).worst_below_target_cut_rms_db,2) + " / " + panel.app.num(panel.chosen.low_cut_limit_db !== undefined ? panel.chosen.low_cut_limit_db : comparison.low_cut_limit_db,2) + " dB RMS"; color:panel.chosen.within_limit ? "#8db9ac" : "#dfc28c"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
+            Text { text:"原低處額外減益 " + panel.app.num((panel.chosen.metrics || {}).worst_below_target_cut_rms_db,2) + " / " + panel.app.num(panel.chosen.low_cut_limit_db !== undefined ? panel.chosen.low_cut_limit_db : comparison.low_cut_limit_db,2) + " dB RMS"; color:panel.chosen.within_limit ? "#8db9ac" : "#dfc28c"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
         }
         Text { visible:panel.chosen.active_band_count === 0; text:"本輪沒有產生有效修正；此結果作為不套用 EQ 的參照。"; color:"#c2b891"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap }
         Text { visible:panel.historical; text:"此為歷史比較，亮色標籤是當時保存的方案；下方曲線顯示該版本。"; color:"#7894aa"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap }

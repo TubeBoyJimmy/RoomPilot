@@ -130,13 +130,13 @@ def _generate_legacy_candidates(measurements, settings, progress=None, cancel=No
 
 
 def generate_peq_candidates(measurements, settings, progress=None, cancel=None, *,
-                            base_peq=None, low_cut_limit_db=1.0) -> dict:
+                            base_peq=None, low_cut_limit_db=1.0, incumbent_peq=None) -> dict:
     """V4 returns one three-variant calculation group; persistence is atomic in Bridge.
 
     Explicit legacy mode remains for old callers and reproducible old-policy
     diagnostics. The v4 UI always supplies peak or shape.
     """
-    if (settings or {}).get("objective_mode", "legacy") == "legacy":
+    if (settings or {}).get("objective_mode", "legacy") == "legacy" and (settings or {}).get("guard_policy") != "v5":
         return _generate_legacy_candidates(measurements, settings, progress, cancel,
                                            base_peq=base_peq, low_cut_limit_db=low_cut_limit_db)
     from .analysis import _target_reference, _validate_base_peq, explain_peq, evaluate_peq
@@ -158,6 +158,8 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
                          measurement_ids=[], statistic="沿用已選方案的目標水平")
         frozen_explanation = explain_peq(measurements, s, base_peq["filters"], target)
         floor = frozen_explanation["summary"]["after"]["worst_below_target_cut_rms_db"]
+        if s.get("guard_policy") == "v5":
+            floor = frozen_explanation["protection"]["summary"]["worst_below_target_cut_rms_db"]
         if floor > limit + 1e-6:
             raise ValueError(f"保留方案在本次完整頻段已造成 {floor:.3f} dB 低處 RMS，超過 {limit:.3f} dB 上限；請提高容許量或改成重新計算。")
         floor = min(floor, limit)
@@ -176,8 +178,15 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
     for index, (fraction, title) in enumerate(zip((.35, .65, 1.), labels)):
         cap = floor + (limit - floor) * fraction
         fit_settings = {**s, "target_level":target, "low_cut_limit_db":cap}
+        seed, seed_report = None, None
+        extra = {}
+        if s.get("guard_policy") == "v5" and s["strategy"] != "extend_existing":
+            from .reference import choose_incumbent
+            seed, seed_report = choose_incumbent(measurements, fit_settings, target,
+                                                [incumbent_peq, candidates[-1]["result"] if candidates else None])
+            extra["incumbent_peq"] = seed
         result = generate_peq(measurements, fit_settings,
-                              lambda value, i=index: report((i + value) / 3), cancel, base_peq=base_peq)
+                              lambda value, i=index: report((i + value) / 3), cancel, base_peq=base_peq, **extra)
         _cancelled(cancel)
         result["target_reference"] = deepcopy(reference)
         result["settings"]["target_level"] = s["target_level"]
@@ -208,19 +217,32 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
             result["explanation"] = explain_peq(measurements, result["settings"], result["filters"], target, frozen_counts=frozen_counts)
             result["explanation"]["cost_provenance"] = "current_policy_reused_feasible_solution"
         explanation = result["explanation"]
+        if s.get("guard_policy") == "v5":
+            from .reference import compare_reference
+            result["incumbent_comparison"] = seed_report
+            result["reference_comparison"] = compare_reference(measurements, s, result["filters"], incumbent_peq or base_peq)
         if reference_metrics is None:
             reference_metrics = dict(summary=deepcopy(explanation["summary"]["before"]),
                                      positions=[{**{k:p[k] for k in ("id", "channel", "position", "weight")}, **p["before"]} for p in explanation["positions"]])
         violations = [dict(id=p["id"], channel=p["channel"], position=p["position"], value_db=p["after"]["below_target_cut_rms_db"], limit_db=cap)
                       for p in explanation["positions"] if p["after"]["below_target_cut_rms_db"] > cap + 1e-6]
+        if s.get("guard_policy") == "v5":
+            violations = [dict(channel=channel, **constraint)
+                          for channel, diagnostic in explanation["protection"]["channels"].items()
+                          for constraint in diagnostic["constraints"] if not constraint["passed"]]
         if violations:
-            raise ValueError(title + " 的取整後方案超出低處 RMS 限制，沒有保存不完整版本。")
+            raise ValueError(title + " 的取整後方案超出修正代價限制，沒有保存不完整版本。")
         count = sum(b.get("enabled", True) and abs(b["gain"]) >= .05 for bands in result["filters"].values() for b in bands)
         purpose = f"低處額外減益容許量 {cap:.3f} dB RMS；在此限制內降低" + ("殘留波峰與具支持低處誤差。" if s["objective_mode"] == "shape" else "殘留波峰。")
+        if s.get("guard_policy") == "v5":
+            purpose += " 同時逐筆限制新增缺口、局部與固定低頻減益；Q 範圍不作音質評分。"
+        metrics = deepcopy(explanation["summary"]["after"])
+        if s.get("guard_policy") == "v5":
+            metrics.update(explanation["protection"]["summary"])
         candidates.append(dict(key=f"candidate_{index+1}", title=title, result=result, purpose=purpose,
                                within_limit=True, pareto=True, is_recommended=False, recommendation_eligible=count > 0,
                                low_cut_limit_db=cap, budget_fraction=fraction, limit_violations=[],
-                               metrics=deepcopy(explanation["summary"]["after"]), active_band_count=count,
+                               metrics=metrics, active_band_count=count,
                                profile_scales=[], notes=[purpose, "每組獨立完整替換；低處上限在求解過程中檢查，含保留 Band，不含前級。"] ))
     # Keep three slots even when their filter parameters coincide; the budgets
     # and search records remain distinct and available in the saved version.
@@ -228,7 +250,7 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
         c["identical_to"] = [other["key"] for other in candidates if other is not c and other["result"]["filters"] == c["result"]["filters"]]
         c["pareto"] = not any(other is not c and all(other["metrics"][field] <= c["metrics"][field] + 1e-9 for field in ("primary_rms_db", "worst_below_target_cut_rms_db")) and any(other["metrics"][field] < c["metrics"][field] - 1e-9 for field in ("primary_rms_db", "worst_below_target_cut_rms_db")) for other in candidates)
     report(1.)
-    return dict(schema_version=2, candidates=candidates, target_level=target, target_reference=reference,
+    result = dict(schema_version=2, candidates=candidates, target_level=target, target_reference=reference,
                 low_cut_limit_db=limit, frozen_low_cut_floor_db=floor, reference_metrics=reference_metrics,
                 selected_key=candidates[0]["key"], recommended_key="", has_feasible_candidate=True,
                 objective_mode=s["objective_mode"], comparison_scope="同一 PEQ 版本內三個 RMS 容許量策略；有限搜尋，不保證全域最優。",
@@ -236,3 +258,8 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
                 notes=["三組共用 Baseline、目標與設備能力，低處 RMS 容許量為 35%、65%、100%。比例是可檢驗的產品預設，不是聲學標準。",
                        "保留擴充時，從既有完整 EQ 的低處 RMS 起算剩餘容許量；不能先降低目標或改寫保留參數。",
                        "三組一同保存在一個 PEQ 版本，切換方案不表示已套用。"])
+    if s.get("guard_policy") == "v5":
+        result["notes"] += ["v0.5 三組共同遵守全部頻點新增缺口、局部及固定 80–200 Hz 減益上限；每筆原始量測分開驗算，不把重錄平均當成個別通過。",
+                            "既有方案只在同一目標與目前限制下通過驗算後，才作為可精修的搜尋起點；低頻走勢比較不改變目標。"]
+        result["guard_policy"] = "v5"
+    return result

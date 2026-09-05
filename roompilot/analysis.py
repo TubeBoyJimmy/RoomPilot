@@ -18,7 +18,9 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 
-ALGORITHM_VERSION = "roompilot-peq-4.0"
+from .protection import GUARD_DEFAULTS, ProtectionModel, CurveFootprint
+
+ALGORITHM_VERSION = "roompilot-peq-5.0"
 DEFAULTS = dict(bands=5, independent=True, f_min=30.0, f_max=200.0,
                 max_cut=6.0, max_total_cut=9.0, min_q=0.4, max_q=6.0,
                 gain_step=0.1, freq_step=1.0, q_step=0.01,
@@ -27,7 +29,8 @@ DEFAULTS = dict(bands=5, independent=True, f_min=30.0, f_max=200.0,
                 target_ref_min=80.0, target_ref_max=200.0,
                 strategy="bass_first", bass_drift_limit_db=0.5, overshoot_scale=1.0,
                 objective_mode="legacy", low_cut_limit_db=1.0,
-                supports_preamp=True, preamp_margin_db=0.5, max_total_boost=3.0)
+                supports_preamp=True, preamp_margin_db=0.5, max_total_boost=3.0,
+                **GUARD_DEFAULTS)
 GRID_PPO = 192
 
 
@@ -177,6 +180,17 @@ def quality_report(measurements, settings=None) -> list[dict]:
 
 def _settings(settings):
     s = {**DEFAULTS, **(settings or {})}
+    if s["guard_policy"] not in ("legacy", "v5"):
+        raise ValueError("保護政策必須為 legacy 或 v5。")
+    for key in ("added_deficit_rms_limit_db", "added_deficit_max_limit_db", "local_cut_limit_db", "bass_mean_cut_limit_db", "outside_cut_limit_db"):
+        if not _number(s[key]) or not 0 <= s[key] <= 30:
+            raise ValueError(key + " 必須為 0–30 dB 的有限數值。")
+        s[key] = float(s[key])
+    if not _number(s["local_window_octaves"]) or not 1 / 12 <= s["local_window_octaves"] <= 1:
+        raise ValueError("局部保護窗口必須為 1/12–1 octave。")
+    s["local_window_octaves"] = float(s["local_window_octaves"])
+    if s["guard_policy"] == "v5" and s["objective_mode"] == "legacy":
+        s["objective_mode"] = "peak"
     if not isinstance(s["bands"], int) or isinstance(s["bands"], bool) or not 1 <= s["bands"] <= 128:
         raise ValueError("本次搜尋 Band 上限必須為 1–128 的整數；128 為運算資源上限，不是設備限制。")
     for key in ("independent", "allow_boost", "allow_extended", "supports_preamp"):
@@ -236,9 +250,7 @@ def filter_response(frequency, filters, sample_rate=48000) -> np.ndarray:
     fs = float(sample_rate)
     if not np.isfinite(fs) or fs <= 0 or not np.all(np.isfinite(f)) or np.any(f < 0) or np.any(f > fs / 2):
         raise ValueError("濾波器評估頻率必須在 DC 至 Nyquist 範圍。")
-    z = np.exp(-2j * np.pi * f / fs)
-    z2 = z * z
-    answer = np.zeros(f.shape, dtype=np.float64)
+    active = []
     for band in filters:
         if not band.get("enabled", True):
             continue
@@ -249,14 +261,9 @@ def filter_response(frequency, filters, sample_rate=48000) -> np.ndarray:
             raise ValueError("濾波器參數無效。")
         if abs(gain) < 1e-12:
             continue
-        a = 10 ** (gain / 40)
-        w = 2 * np.pi * fc / fs
-        alpha = np.sin(w) / (2 * q)
-        common = -2 * np.cos(w) * z
-        num = 1 + alpha * a + common + (1 - alpha * a) * z2
-        den = 1 + alpha / a + common + (1 - alpha / a) * z2
-        answer += 20 * np.log10(np.maximum(np.abs(num / den), 1e-30))
-    return answer
+        active.append(band)
+    from .biquad import responses
+    return np.asarray(responses(f, active, fs).sum(axis=0))
 
 
 def _cancelled(cancel):
@@ -284,6 +291,50 @@ def _group_curves(measurements, grid):
     if not curves:
         raise ValueError("請先將量測指定為 L 或 R；L+R 不能代替獨立聲道。")
     return np.array(curves), names, max(repeats) if repeats else None
+
+
+def _raw_curves(measurements, grid):
+    """Keep every repeat for protection; the historical objective stays averaged."""
+    rows, names = [], []
+    for index, m in enumerate(measurements):
+        if m.get("channel") not in ("L", "R"):
+            continue
+        f, y = _arrays(m)
+        if f[0] > grid[0] or f[-1] < grid[-1]:
+            raise ValueError("逐筆保護量測未涵蓋分析網格。")
+        rows.append(np.interp(np.log(grid), np.log(f), y))
+        names.append((m["channel"], m.get("position", "P0"), str(m.get("name") or m.get("id") or index + 1)))
+    return np.asarray(rows), names
+
+
+def _protection_snapshot(grid, raw_ys, raw_names, target, s, filters):
+    channels = {}
+    footprint = CurveFootprint(s)
+    for key, bands in filters.items():
+        ids = [i for i, name in enumerate(raw_names) if key == "Shared" or name[0] == key]
+        if not ids:
+            continue
+        model = ProtectionModel(grid, raw_ys[ids], target, s, names=[raw_names[i] for i in ids])
+        channels[key] = model.diagnostics(filter_response(grid, bands, s["sample_rate"]))
+        channels[key]["footprint"] = footprint.diagnostics(filter_response(footprint.grid, bands, s["sample_rate"]))
+        if s["guard_policy"] == "v5":
+            channels[key]["measured_feasible"] = channels[key]["feasible"]
+            channels[key]["feasible"] = channels[key]["feasible"] and channels[key]["footprint"]["feasible"]
+            channels[key]["constraints"] += deepcopy(channels[key]["footprint"]["constraints"])
+    summary = {field: max((v[field] for v in channels.values()), default=0.)
+               for field in ("worst_added_deficit_rms_db", "worst_added_deficit_max_db", "worst_below_target_cut_rms_db")}
+    summary["max_local_cut_db"] = max((v["local_cut"]["max_mean_db"] for v in channels.values()), default=0.)
+    bass = [v["bass_mean_cut"]["mean_db"] for v in channels.values() if v["bass_mean_cut"]["mean_db"] is not None]
+    summary["max_bass_mean_cut_db"] = max(bass) if bass else None
+    summary["max_outside_cut_db"] = max((v["footprint"]["outside_cut"]["max_db"] for v in channels.values()), default=0.)
+    summary["max_full_local_cut_db"] = max((v["footprint"]["local_cut"]["max_mean_db"] for v in channels.values()), default=0.)
+    return dict(policy=s["guard_policy"], enforced=s["guard_policy"] == "v5", basis="individual_recordings",
+                channels=channels, summary=summary,
+                notes=["逐筆驗算與既有同位置平均後的指標分開保存；取各筆最差值，前級不納入。",
+                       "門檻是可調整的工程起始值，不是可聽差異或聲學安全標準。",
+                       f"聲壓新增低處只檢查 {grid[0]:.1f}–{grid[-1]:.1f} Hz；另以完整 EQ 曲線限制指定頻段外的尾端與全範圍局部減益，不推定未量聲學效果。",
+                       "80–200 Hz 僅檢查實際覆蓋部分；未量範圍不外推，不能宣稱全頻段通過。",
+                       "寬頻走勢是校正後曲線診斷，尚未納入音質排名。"])
 
 
 def _round_value(value, step, lo, hi):
@@ -364,10 +415,10 @@ def _desired_model(grid, ys, target, s, boost_allowed):
     return desired, over_weight, support, excess
 
 
-def _objective(grid, ys, target, s, bands, weights, boost_allowed):
+def _objective(grid, ys, target, s, bands, weights, boost_allowed, *, evidence_ys=None):
     if s.get("objective_mode", "legacy") != "legacy":
         from .solver import objective_components
-        return objective_components(grid, ys, target, s, bands, weights, boost_allowed)
+        return objective_components(grid, ys, target, s, bands, weights, boost_allowed, evidence_ys=evidence_ys)
     desired, over_weight, support, _ = _desired_model(grid, ys, target, s, boost_allowed)
     response = filter_response(grid, bands, s["sample_rate"])
     error = response[None, :] - desired
@@ -385,6 +436,7 @@ def _evaluation_policy(s):
     return dict(algorithm_version=ALGORITHM_VERSION, overshoot_scale=s["overshoot_scale"],
                 objective_mode=s["objective_mode"], low_cut_limit_db=s["low_cut_limit_db"],
                 hard_low_cut_constraint=s["objective_mode"] != "legacy",
+                guard_policy=s["guard_policy"], individual_recording_guards=s["guard_policy"] == "v5",
                 preamp_in_objective=False)
 
 
@@ -422,7 +474,7 @@ def _metric_snapshot(grid, ys, names, target, filters, sample_rate):
     return dict(summary=summary, positions=positions)
 
 
-def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None):
+def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None, *, raw_ys=None, raw_names=None):
     """Counterfactuals assess the rounded filters, including disabled/frozen rows.
 
     The diagnostic metrics are invariant to overshoot_scale for fixed filters.
@@ -440,17 +492,20 @@ def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None):
     band_rows, native_before, native_after = [], [], []
     for key, bands in filters.items():
         ids = [i for i, (ch, _) in enumerate(names) if key == "Shared" or ch == key]
+        evidence = None
+        if s["guard_policy"] == "v5" and raw_ys is not None:
+            evidence = raw_ys[[i for i, name in enumerate(raw_names) if key == "Shared" or name[0] == key]]
         subset_names = [names[i] for i in ids]
         weights = _position_weights(subset_names)
         positions_by_channel = {ch:{pos for cc, pos in subset_names if ch == cc} for ch, _ in subset_names}
         boost_ready = s["allow_boost"] and s["min_q"] <= 2 and all({"P0", "P-10", "P+10"}.issubset(ps) for ps in positions_by_channel.values())
-        cost = _objective(grid, ys[ids], target, s, bands, weights, boost_ready)
-        native_before.append(_objective(grid, ys[ids], target, s, [], weights, boost_ready)["value"])
+        cost = _objective(grid, ys[ids], target, s, bands, weights, boost_ready, evidence_ys=evidence)
+        native_before.append(_objective(grid, ys[ids], target, s, [], weights, boost_ready, evidence_ys=evidence)["value"])
         native_after.append(cost["value"])
         for index, band in enumerate(bands):
             remaining = bands[:index] + bands[index + 1:]
             removed = {**filters, key:remaining}
-            without_cost = _objective(grid, ys[ids], target, s, remaining, weights, boost_ready)
+            without_cost = _objective(grid, ys[ids], target, s, remaining, weights, boost_ready, evidence_ys=evidence)
             enabled = band.get("enabled", True)
             frozen = index < frozen_counts.get(key, 0)
             flags = _boundary_flags(band, s)
@@ -514,9 +569,11 @@ def explain_peq(measurements, settings, filters, target_level, *, frozen_counts=
                     or not 0 < band["frequency"] < s["sample_rate"] / 2 or band["q"] <= 0 or abs(band["gain"]) > 100
                     or band.get("type", "PK") not in ("PK", "Peak", "Bell", "Peaking")):
                 raise ValueError("保存的濾波器含無效 biquad 參數，無法產生診斷。")
-    explanation = _explain_peq(grid, ys, names, s["target_level"], s, filters, frozen_counts)
+    raw_ys, raw_names = _raw_curves(usable, grid)
+    explanation = _explain_peq(grid, ys, names, s["target_level"], s, filters, frozen_counts, raw_ys=raw_ys, raw_names=raw_names)
     explanation["cost_provenance"] = "posthoc_current_policy"
     explanation["evaluation_policy"] = _evaluation_policy(s)
+    explanation["protection"] = _protection_snapshot(grid, raw_ys, raw_names, s["target_level"], s, filters)
     explanation["notes"].append("成本是以目前評估政策事後重算，不代表舊版產生當時的成本或取捨；保存參數未取整、未重算。")
     return explanation
 
@@ -803,7 +860,7 @@ def _validate_base_peq(base, s, expected_keys):
     return old
 
 
-def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq=None) -> dict:
+def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq=None, incumbent_peq=None) -> dict:
     """Return one complete replacement; extension freezes a previous filter set."""
     started = time.perf_counter()
     _cancelled(cancel)
@@ -828,6 +885,7 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
         raise ValueError("所選量測沒有共同校正頻段。")
     grid = _log_grid(low, high)
     ys, names, repeat = _group_curves(usable, grid)
+    raw_ys, raw_names = _raw_curves(usable, grid)
     if not any(pos == "P0" for _, pos in names):
         raise ValueError("請提供中央位置 P0 的 Baseline。")
     groups = [(ch, [i for i, (channel, _) in enumerate(names) if channel == ch]) for ch in sorted({c for c, _ in names})] if s["independent"] else [("Shared", list(range(len(names))))]
@@ -853,6 +911,15 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
     total_evals = 0
     for gi, (key, ids) in enumerate(groups):
         subset_names = [names[i] for i in ids]
+        raw_ids = [i for i, name in enumerate(raw_names) if key == "Shared" or name[0] == key]
+        fit_extra = {}
+        if s["guard_policy"] == "v5":
+            fit_extra = dict(raw_ys=raw_ys[raw_ids], raw_names=[raw_names[i] for i in raw_ids])
+            if (isinstance(incumbent_peq, dict) and _number(incumbent_peq.get("target_level"))
+                    and abs(float(incumbent_peq["target_level"]) - target) < 1e-6):
+                candidate = incumbent_peq.get("filters", {}).get(key)
+                if isinstance(candidate, list):
+                    fit_extra["incumbent"] = deepcopy(candidate)
         positions = {ch: {pos for cc, pos in subset_names if cc == ch} for ch, _ in subset_names}
         boost_ready = s["allow_boost"] and s["min_q"] <= 2 and all({"P0", "P-10", "P+10"}.issubset(ps) for ps in positions.values())
         if s["allow_boost"] and not boost_ready:
@@ -877,7 +944,7 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                 # Account for the whole requested domain and all filter tails
                 # from the first stage; only the first-stage centres are <=200.
                 frozen, count, info = fit_function(grid, ys[ids], target, s, boost_ready,
-                                                  cancel, lambda v: callback(v * .65), names=subset_names, center_max=200.)
+                                                  cancel, lambda v: callback(v * .65), names=subset_names, center_max=200., **fit_extra)
             evals += count
             stages.append(dict(name="低頻優先", band_count=len(frozen), f_min=low, f_max=200., objective_evaluations=count, search=info))
             skipped.extend(info["skipped"])
@@ -892,13 +959,14 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                 center_min = (math.floor(boundary / s["freq_step"] + 1e-9) + 1) * s["freq_step"]
                 additions, count, info = fit_function(grid, ys[ids], target, s, boost_ready, cancel,
                                              lambda v: callback(.65 + .35 * v), names=subset_names,
-                                             frozen=frozen, center_min=center_min, slots=slots, protect_grid=protected)
+                                             frozen=frozen, center_min=center_min, slots=slots, protect_grid=protected,
+                                             **{k: v for k, v in fit_extra.items() if k != "incumbent"})
                 evals += count
                 skipped.extend(info["skipped"])
                 reason_codes.extend(info["reason_codes"])
                 stages.append(dict(name="使用剩餘 Band 延伸", band_count=len(additions), f_min=center_min, f_max=high, objective_evaluations=count, merges=info["merges"], search=info))
         else:
-            additions, evals, info = fit_function(grid, ys[ids], target, s, boost_ready, cancel, callback, names=subset_names)
+            additions, evals, info = fit_function(grid, ys[ids], target, s, boost_ready, cancel, callback, names=subset_names, **fit_extra)
             stages.append(dict(name="整體重算" if s["strategy"] == "joint" else "低頻優先", band_count=len(additions), objective_evaluations=evals, merges=info["merges"], search=info))
             skipped.extend(info["skipped"])
             reason_codes.extend(info["reason_codes"])
@@ -910,9 +978,10 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                                 bass_drift_db=drift, protected_max_hz=boundary, skipped=skipped,
                                 reason_codes=list(dict.fromkeys(reason_codes)), stages=stages)
         weights = _position_weights(subset_names)
-        objectives[key] = dict(before=_objective(grid, ys[ids], target, s, [], weights, boost_ready),
-                               after=_objective(grid, ys[ids], target, s, bands, weights, boost_ready),
-                               prior=_objective(grid, ys[ids], target, s, frozen, weights, boost_ready),
+        evidence = raw_ys[raw_ids] if s["guard_policy"] == "v5" else None
+        objectives[key] = dict(before=_objective(grid, ys[ids], target, s, [], weights, boost_ready, evidence_ys=evidence),
+                               after=_objective(grid, ys[ids], target, s, bands, weights, boost_ready, evidence_ys=evidence),
+                               prior=_objective(grid, ys[ids], target, s, frozen, weights, boost_ready, evidence_ys=evidence),
                                position_weights={f"{ch}:{pos}": float(w) for (ch, pos), w in zip(subset_names, weights)})
     # Reuse exact manual validation/metrics. It never changes feasible rounded
     # values, including the order and disabled parameters of the locked filters.
@@ -940,9 +1009,10 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                                    remaining_counts={k: a["remaining_count"] for k, a in allocations.items()},
                                    bass_drift_db={k: a["bass_drift_db"] for k, a in allocations.items()},
                                    skipped=[f"{k}：{reason}" for k, a in allocations.items() for reason in a["skipped"]])
-    evaluated["explanation"] = _explain_peq(grid, ys, names, target, s, filters, evaluated["allocation"]["frozen_counts"])
+    evaluated["explanation"] = _explain_peq(grid, ys, names, target, s, filters, evaluated["allocation"]["frozen_counts"], raw_ys=raw_ys, raw_names=raw_names)
     evaluated["explanation"]["cost_provenance"] = "current_policy_on_rounded_result"
     evaluated["explanation"]["evaluation_policy"] = _evaluation_policy(s)
+    evaluated["explanation"]["protection"] = evaluated["metrics"]["protection"]
     rationale = [f"校正 {s['f_min']:g}–{s['f_max']:g} Hz；左右共用 {target:.2f} dB 目標，校正範圍不會改變參考範圍。",
                  (f"自動目標固定參考 P0 的 {s['target_ref_min']:g}–{s['target_ref_max']:g} Hz；" + reference["statistic"] + "。") if reference["mode"] == "fixed_reference" else "目標水平由使用者指定或從保留方案繼承，不另行估算。",
                  "同聲道同位置重錄在對數頻率軸以 dB 平均，不混合複數相位；多位置目標函數以 P0 67%、偏移位置合計 33% 加權。",
@@ -952,6 +1022,10 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
     if s["objective_mode"] != "legacy":
         rationale[3] = f"主目標直接使用殘留波峰{'與具支持低處' if s['objective_mode'] == 'shape' else ''}誤差；低處額外減益 {s['low_cut_limit_db']:.3f} dB RMS 在求解中逐位置約束，沒有固定 Band 罰分。"
         rationale[4] = "搜尋涵蓋各剩餘峰與對數頻率起點，交錯新增與精修，再嘗試新增；停止表示本輪未找到達門檻的可行改善，並非全域最優。"
+    if s["guard_policy"] == "v5":
+        rationale[3] = "主目標維持殘留波峰" + ("與具逐筆支持的低處誤差" if s["objective_mode"] == "shape" else "") + "；逐筆重錄各自限制原低處、新增低處、局部平均減益及固定低頻範圍減益，避免平均曲線掩蓋個別記錄。"
+        rationale.append("新增保護門檻為可調整的工程起始值；Q 上限維持使用者設定，寬頻走勢僅作診斷，沒有預設聽感排名。")
+        evaluated["objective"]["hard_constraints"].update({k: s[k] for k in GUARD_DEFAULTS})
     for key, a in allocations.items():
         if a["protected_max_hz"] is not None:
             rationale.append(f"{key}：鎖定 {a['frozen_count']} Band，新增 {a['new_count']} Band，剩餘 {a['remaining_count']} Band；保留範圍合成曲線變化 {a['bass_drift_db']:.3f} dB（上限 {s['bass_drift_limit_db']:g} dB）。")
@@ -972,9 +1046,83 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
     evaluated["warnings"] = list(dict.fromkeys(warnings + evaluated["warnings"]))
     for curve in evaluated["curves"]:
         curve["name"] = curve["name"].replace("手動調整預測", "PEQ 預測")
+    if s["guard_policy"] == "v5" and s["strategy"] != "extend_existing" and incumbent_peq:
+        evaluated = _retain_complete_incumbent(usable, s, target, reference, evaluated, incumbent_peq, cancel)
+        evaluated["metrics"]["elapsed_seconds"] = time.perf_counter() - started
     if progress:
         progress(1.)
     return evaluated
+
+
+def _retain_complete_incumbent(measurements, s, target, reference, attempted, incumbent, cancel):
+    """A staged search may reject >200 Hz seeds; retain the complete feasible set.
+
+    Re-evaluate on today's whole domain, guardrails, target and entry steps. This
+    fallback is never used by extension, whose frozen-prefix semantics differ.
+    """
+    from .reference import choose_incumbent
+
+    _cancelled(cancel)
+    chosen, checks = choose_incumbent(measurements, s, target, [incumbent])
+    if chosen is None:
+        attempted["complete_incumbent_check"] = {**checks, "retained": False}
+        return attempted
+    retained = evaluate_peq(measurements, s, chosen["filters"], target)
+    attempt_rms = attempted["explanation"]["summary"]["after"]["primary_rms_db"]
+    retained_rms = retained["explanation"]["summary"]["after"]["primary_rms_db"]
+    detail = {**checks, "attempted_primary_rms_db": attempt_rms,
+              "incumbent_primary_rms_db": retained_rms, "retained": retained_rms < attempt_rms - 1e-9}
+    if not detail["retained"]:
+        attempted["complete_incumbent_check"] = detail
+        return attempted
+    # choose_incumbent has verified exact entry-step compatibility. Preserve
+    # original ordering/disabled rows and keep the failed search as an attempt.
+    retained["filters"] = deepcopy(chosen["filters"])
+    retained["settings"] = deepcopy(s)
+    retained["target_reference"] = deepcopy(reference)
+    retained["metrics"].update(manual_edit=False,
+                               objective_evaluations=attempted["metrics"]["objective_evaluations"],
+                               elapsed_seconds=attempted["metrics"]["elapsed_seconds"])
+    retained["complete_incumbent_check"] = detail
+    reason = "本次分階段搜尋未改善既有完整可行方案，保留其完整參數；已按本次全頻段與逐筆保護重新驗算，不是鎖定前一階段或宣稱全域最優。"
+    channels = {}
+    for key, bands in retained["filters"].items():
+        channels[key] = dict(frozen_count=0, new_count=len(bands), remaining_count=s["bands"] - len(bands),
+                             bass_drift_db=0., protected_max_hz=None, skipped=[reason],
+                             reason_codes=["retained_complete_incumbent"],
+                             stages=[dict(name="保留完整可行起點", band_count=len(bands), source_peq_id=chosen.get("id", ""))])
+    retained["allocation"] = dict(strategy=s["strategy"], channels=channels,
+                                  frozen_counts={k: 0 for k in channels},
+                                  remaining_counts={k: v["remaining_count"] for k, v in channels.items()},
+                                  bass_drift_db={k: 0. for k in channels}, skipped=[reason],
+                                  retained_complete_incumbent=True, source_peq_id=chosen.get("id", ""),
+                                  attempted_search=deepcopy(attempted["allocation"]))
+    retained["explanation"]["cost_provenance"] = "current_policy_reused_feasible_solution"
+    retained["rationale"] = attempted["rationale"][:2] + [reason, "這是完整替換設定，並未與前一版疊加；預測不等於實測改善。"]
+    retained["warnings"] = list(dict.fromkeys(retained["warnings"] + attempted["warnings"]))
+    for curve in retained["curves"]:
+        curve["name"] = curve["name"].replace("手動調整預測", "PEQ 預測")
+    retained["objective"] = {k: deepcopy(v) for k, v in attempted["objective"].items() if k != "channels"}
+    retained["objective"]["evaluation_source"] = "fresh_explanation_of_retained_complete_incumbent"
+    retained["objective"]["attempted_channels"] = deepcopy(attempted["objective"]["channels"])
+    grid = np.asarray(retained["curves"][0]["frequency"])
+    ys, names, _ = _group_curves(measurements, grid)
+    raw_ys, raw_names = _raw_curves(measurements, grid)
+    objectives = {}
+    for key, bands in retained["filters"].items():
+        ids = [i for i, (ch, _) in enumerate(names) if key == "Shared" or ch == key]
+        subset_names = [names[i] for i in ids]
+        weights = _position_weights(subset_names)
+        positions = {ch: {pos for cc, pos in subset_names if cc == ch} for ch, _ in subset_names}
+        ready = s["allow_boost"] and s["min_q"] <= 2 and all({"P0", "P-10", "P+10"}.issubset(ps) for ps in positions.values())
+        evidence = raw_ys[[i for i, name in enumerate(raw_names) if key == "Shared" or name[0] == key]]
+        before = _objective(grid, ys[ids], target, s, [], weights, ready, evidence_ys=evidence)
+        after = _objective(grid, ys[ids], target, s, bands, weights, ready, evidence_ys=evidence)
+        objectives[key] = dict(before=before, after=after, prior=deepcopy(before),
+                               position_weights={f"{ch}:{pos}": float(w) for (ch, pos), w in zip(subset_names, weights)})
+    retained["objective"]["channels"] = objectives
+    _cancelled(cancel)
+    return retained
 
 
 def _analysis_config(md):
@@ -1014,6 +1162,7 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
         raise ValueError("所選量測沒有共同校正頻段。")
     grid = _log_grid(lo, hi)
     ys, names, repeat = _group_curves(measurements, grid)
+    raw_ys, raw_names = _raw_curves(usable, grid)
     if not any(pos == "P0" for _, pos in names):
         raise ValueError("手動驗算需要中央 P0 的 Baseline。")
     target, reference = _target_reference(usable, s)
@@ -1044,11 +1193,16 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
             normalized[key].append(dict(frequency=fc, gain=gain, q=q, enabled=band.get("enabled", True), type="PK"))
     sigma = GRID_PPO / 48 / 2.355
     excess = gaussian_filter1d(ys, sigma=sigma, axis=1, mode="nearest") - target
+    raw_excess = gaussian_filter1d(raw_ys, sigma=sigma, axis=1, mode="nearest") - target
     centers = [b["frequency"] for bands in normalized.values() for b in bands]
-    dense = np.unique(np.concatenate((np.geomspace(1, s["sample_rate"] / 2 * .99999, 16384), grid, centers)))
+    footprint = CurveFootprint(s)
+    dense = np.unique(np.concatenate((np.geomspace(1, s["sample_rate"] / 2 * .99999, 16384), grid, centers,
+                                      footprint.grid if s["guard_policy"] == "v5" else [])))
     max_gain, max_attenuation = 0., 0.
     for key, bands in normalized.items():
         ids = [i for i, (ch, _) in enumerate(names) if key == "Shared" or key == ch]
+        raw_ids = [i for i, name in enumerate(raw_names) if key == "Shared" or name[0] == key]
+        support_excess = raw_excess[raw_ids] if s["guard_policy"] == "v5" else excess[ids]
         enabled_boosts = [b for b in bands if b["enabled"] and b["gain"] > 0]
         if enabled_boosts:
             involved_channels = {names[i][0] for i in ids}
@@ -1063,22 +1217,36 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
                 core = np.abs(np.log2(grid / fc)) <= min(.2, 1 / band["q"] / 3)
                 if not core.any():
                     raise ValueError("增益中心缺少有效量測頻點。")
-                support = np.mean((excess[ids][:, core] < -.5) & (excess[ids][:, core] > -4.), axis=1)
+                support = np.mean((support_excess[:, core] < -.5) & (support_excess[:, core] > -4.), axis=1)
                 if np.any(support < .8):
                     raise ValueError(f"{key} 的 {fc:g} Hz 增益缺少各位置一致的寬頻凹陷支持，或會填補深凹洞。")
         response = filter_response(dense, bands, s["sample_rate"])
         if response.min(initial=0) < -s["max_total_cut"] - 1e-6 or response.max(initial=0) > _combined_boost_limit(s) + 1e-6:
             raise ValueError("多段濾波器疊加後超出總 Gain 限制，請減少修正幅度。")
+        if s["guard_policy"] == "v5":
+            full_curve = filter_response(footprint.grid, bands, s["sample_rate"])
+            if np.min(footprint.slacks(full_curve), initial=0) < -1e-6:
+                raise ValueError(f"{key} 超過完整 EQ 曲線保護：{footprint.describe_violations(full_curve)}。請調整原段參數或明確的保護上限。")
+            outside = (dense < s["f_min"]) | (dense > s["f_max"])
+            oi = int(np.argmin(response[outside]))
+            if response[outside][oi] < -s["outside_cut_limit_db"] - 1e-6:
+                raise ValueError(f"{key} 指定頻段外 {dense[outside][oi]:.2f} Hz 合成減益 {-response[outside][oi]:.3f} dB 超過完整 EQ 曲線保護上限 {s['outside_cut_limit_db']:.3f} dB。")
         local = filter_response(grid, bands, s["sample_rate"])
+        if s["guard_policy"] == "v5":
+            protection = ProtectionModel(grid, raw_ys[raw_ids], target, s, names=[raw_names[i] for i in raw_ids])
+            violations = [(name, slack) for name, slack in zip(protection.constraint_names, protection.slacks(local)) if slack < -1e-6]
+            if violations:
+                raise ValueError(f"{key} 超過逐筆量測保護限制：{protection.describe_violations(local)}。請減少修正或調整明確的保護上限。")
         if s["objective_mode"] != "legacy":
-            for i in ids:
+            for i in (ids if s["guard_policy"] != "v5" else []):
                 below = ys[i] < target
                 low_cut = float(np.sqrt(np.mean(np.maximum(-local[below], 0.) ** 2))) if below.any() else 0.
                 if low_cut > s["low_cut_limit_db"] + 1e-6:
                     raise ValueError(f"{names[i][0]} · {names[i][1]} 的低處額外減益 {low_cut:.3f} dB RMS 超過本策略 {s['low_cut_limit_db']:.3f} dB 上限。")
             if enabled_boosts:
                 from .solver import _Model
-                model = _Model(grid, ys[ids], target, s, True, _position_weights([names[i] for i in ids]))
+                model = _Model(grid, ys[ids], target, s, True, _position_weights([names[i] for i in ids]),
+                               evidence_ys=raw_ys[raw_ids] if s["guard_policy"] == "v5" else None)
                 unsupported = ~model.support
                 if unsupported.any() and np.any(local[unsupported] > model.boost_tail_cap[unsupported] + 1e-6):
                     raise ValueError(f"{key} 合成增益在缺少支持的頻點超過允許的尾端影響；請減少增益或調整頻寬。")
@@ -1120,6 +1288,12 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
         warnings.append(f"组合濾波器最高增益 {max_gain:.2f} dB；建議前級 {preamp:.1f} dB，仍需確認喇叭與擴大機餘裕。")
     if s["allow_extended"]:
         warnings.append("已啟用 200 Hz 以上校正；請以偏移量測核對空間一致性。")
+    protection = _protection_snapshot(grid, raw_ys, raw_names, target, s, normalized)
+    if s["guard_policy"] == "v5" and any(not ch["bass_mean_cut"]["coverage_complete"] for ch in protection["channels"].values()):
+        warnings.append("固定 80–200 Hz 平均減益只有部分或沒有覆蓋；限制僅套用可用交集，不能視為完整低頻範圍通過。")
+    explanation = _explain_peq(grid, ys, names, target, s, normalized, raw_ys=raw_ys, raw_names=raw_names)
+    explanation["protection"] = protection
+    explanation["evaluation_policy"] = _evaluation_policy(s)
     rationale = ["手動修改已按設備步進取整，並重新檢查每段限制、總 Gain 與增益證據；不會為了通過檢查自動改寫其他 Band。",
                  f"採用原 Baseline 與同一個 {target:.2f} dB 目標水平；這是完整替換設定，不疊加上一版。",
                  "預測曲線以 Baseline 原水平呈現，未扣除前級衰減；補錄比較另顯示含前級的絕對預測。",
@@ -1128,10 +1302,11 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
                 metrics=dict(initial_rmse_db=before, predicted_rmse_db=after, improvement_db=before - after,
                              repeatability_db=repeat, repeatability_definition="同聲道同位置各量測配對差值的 RMS（不移除音量差），再取各組最大值", max_attenuation_db=max_attenuation, max_boost_db=max_gain,
                              channel_metrics=channel_metrics, evaluation_points=len(grid), objective_evaluations=0,
-                             evaluated_f_min=float(grid[0]), evaluated_f_max=float(grid[-1]), manual_edit=True),
+                             evaluated_f_min=float(grid[0]), evaluated_f_max=float(grid[-1]), manual_edit=True,
+                             protection=protection),
                 rationale=rationale, warnings=warnings, curves=curves, preamp_db=preamp,
                 algorithm_version=ALGORITHM_VERSION, replacement=True,
-                explanation=_explain_peq(grid, ys, names, target, s, normalized))
+                explanation=explanation)
 
 
 def _same_config(a, b):

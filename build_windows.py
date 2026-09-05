@@ -32,7 +32,7 @@ environment["PATH"] = os.pathsep.join(map(str, [Path(sys.executable).parent,
     Path(sys.base_prefix), windows / "System32", windows]))
 subprocess.run(command, cwd=root, env=environment, check=True)
 folder = args.dist_dir.resolve() / "RoomPilot"
-for name in ("README.md", "MODEL.md", "KNOWN_LIMITATIONS.md", "THIRD_PARTY_NOTICES.md", "VALIDATION.md"):
+for name in ("README.md", "MODEL.md", "HISTORY.md", "KNOWN_LIMITATIONS.md", "THIRD_PARTY_NOTICES.md", "VALIDATION.md"):
     if (root / name).is_file():
         shutil.copy2(root / name, folder / name)
 from collect_licenses import collect

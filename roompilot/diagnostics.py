@@ -19,11 +19,14 @@ def check_sample(path):
     measurements = import_measurements(path)
     selected = [m for m in measurements if m["channel"] in ("L", "R") and m["position"] == "P0"]
     issues = quality_report(selected)
-    settings = {"bands": 5, "f_min": 30, "f_max": 200, "independent": True, "objective_mode": "peak"}
+    settings = {"bands": 5, "f_min": 30, "f_max": 200, "independent": True, "objective_mode": "peak", "guard_policy": "v5"}
     comparison = generate_peq_candidates(selected, settings, low_cut_limit_db=1.0)
     assert comparison["schema_version"] == 2 and len(comparison["candidates"]) == 3
     assert len({c["key"] for c in comparison["candidates"]}) == 3
     assert all(c["within_limit"] for c in comparison["candidates"])
+    assert all(c["result"]["explanation"]["protection"]["enforced"]
+               and all(p["feasible"] for p in c["result"]["explanation"]["protection"]["channels"].values())
+               for c in comparison["candidates"])
     assert all(c["result"]["target_level"] == comparison["target_level"]
                for c in comparison["candidates"])
     assert all(c["result"]["explanation"]["schema_version"] == 1

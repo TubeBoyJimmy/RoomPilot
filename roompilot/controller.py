@@ -136,6 +136,15 @@ class Bridge(QObject):
     def _active_peqs(self):
         return [q for q in (self.project or {}).get("peqs", []) if not q.get("deleted_at")]
 
+    def _incumbent_for(self, baseline, settings):
+        """Only the selected saved variant on this Baseline can seed a refit."""
+        if settings.get("guard_policy") != "v5" or settings.get("strategy") == "extend_existing":
+            return None
+        selected = next((q for q in self._active_peqs() if q["id"] == self._selected_peq_id), None)
+        if selected and selected.get("baseline_version") == baseline["version"]:
+            return copy.deepcopy(selected)
+        return None
+
     def _next_peq_name(self):
         # A version can contain several strategy records. Deleted versions also
         # reserve their number so restoring a group cannot create a collision.
@@ -611,11 +620,14 @@ class Bridge(QObject):
             if base_peq["baseline_version"] != version:
                 raise ValueError("保留擴充需要目前 Baseline 的 PEQ；請選擇相同 Baseline 版本的方案。")
 
+        incumbent_peq = self._incumbent_for(baseline, settings)
+
         self._clear_candidates()
 
         def run(progress, cancel):
             from .analysis import generate_peq
-            return generate_peq(measurements, settings, progress=progress, cancel=cancel, base_peq=base_peq)
+            extra = {"incumbent_peq": incumbent_peq} if incumbent_peq else {}
+            return generate_peq(measurements, settings, progress=progress, cancel=cancel, base_peq=base_peq, **extra)
 
         def complete(result):
             # Exact repeated computation does not need another durable revision.
@@ -667,6 +679,7 @@ class Bridge(QObject):
             base_peq = copy.deepcopy(self._peq())
             if base_peq["baseline_version"] != version:
                 raise ValueError("保留擴充需要目前 Baseline 的已儲存方案。")
+        incumbent_peq = self._incumbent_for(baseline, settings)
         source_values = lambda q: {k: q.get(k) for k in ("filters", "settings", "target_level", "baseline_version")} if q else None
         context = dict(project_id=p["id"], baseline_version=version, baseline_fingerprint=self._fingerprint(measurements),
                        generation_settings=copy.deepcopy(settings), settings_fingerprint=self._fingerprint(settings),
@@ -677,8 +690,9 @@ class Bridge(QObject):
 
         def run(progress, cancel):
             from .comparison import generate_peq_candidates
+            extra = {"incumbent_peq": incumbent_peq} if incumbent_peq else {}
             return generate_peq_candidates(measurements, settings, progress=progress, cancel=cancel,
-                                           base_peq=base_peq, low_cut_limit_db=low_cut_limit_db)
+                                           base_peq=base_peq, low_cut_limit_db=low_cut_limit_db, **extra)
 
         def complete(result):
             if not self.project or self.project["id"] != context["project_id"] or self.project.get("baseline_version") != version:
