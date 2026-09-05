@@ -10,8 +10,8 @@ import json
 from .analysis import _cancelled, _number, _settings, generate_peq
 
 
-def generate_peq_candidates(measurements, settings, progress=None, cancel=None, *,
-                            base_peq=None, low_cut_limit_db=1.0) -> dict:
+def _generate_legacy_candidates(measurements, settings, progress=None, cancel=None, *,
+                                base_peq=None, low_cut_limit_db=1.0) -> dict:
     """Return at most three complete alternatives; nothing is saved or applied."""
     if not _number(low_cut_limit_db) or not 0 <= low_cut_limit_db <= 6:
         raise ValueError("低處新增削減 RMS 上限必須為 0–6 dB 的有限數值。")
@@ -127,3 +127,112 @@ def generate_peq_candidates(measurements, settings, progress=None, cancel=None, 
                 selected_key=selected["key"], recommended_key=recommended["key"] if recommended else "",
                 has_feasible_candidate=bool(feasible), comparison_scope="本輪最多三個候選；不是全域最優",
                 metric_axes=list(fields), titles_monotone=monotone)
+
+
+def generate_peq_candidates(measurements, settings, progress=None, cancel=None, *,
+                            base_peq=None, low_cut_limit_db=1.0) -> dict:
+    """V4 returns one three-variant calculation group; persistence is atomic in Bridge.
+
+    Explicit legacy mode remains for old callers and reproducible old-policy
+    diagnostics. The v4 UI always supplies peak or shape.
+    """
+    if (settings or {}).get("objective_mode", "legacy") == "legacy":
+        return _generate_legacy_candidates(measurements, settings, progress, cancel,
+                                           base_peq=base_peq, low_cut_limit_db=low_cut_limit_db)
+    from .analysis import _target_reference, _validate_base_peq, explain_peq, evaluate_peq
+    if not _number(low_cut_limit_db) or not 0 <= low_cut_limit_db <= 6:
+        raise ValueError("低處額外減益 RMS 上限必須為 0–6 dB 的有限數值。")
+    limit = float(low_cut_limit_db)
+    measurements = list(measurements)
+    s = _settings(settings)
+    _cancelled(cancel)
+    floor = 0.
+    if s["strategy"] == "extend_existing":
+        if not base_peq or not _number(base_peq.get("target_level")):
+            raise ValueError("請先選取要保留的 PEQ 方案。")
+        expected = {m["channel"] for m in measurements if m.get("channel") in ("L", "R")} if s["independent"] else {"Shared"}
+        _validate_base_peq(base_peq, s, expected)
+        target = float(base_peq["target_level"])
+        reference = dict(mode="inherited", level_db=target, source_peq_id=base_peq.get("id", ""),
+                         original=deepcopy(base_peq.get("target_reference", {})), coverage_complete=None,
+                         measurement_ids=[], statistic="沿用已選方案的目標水平")
+        frozen_explanation = explain_peq(measurements, s, base_peq["filters"], target)
+        floor = frozen_explanation["summary"]["after"]["worst_below_target_cut_rms_db"]
+        if floor > limit + 1e-6:
+            raise ValueError(f"保留方案在本次完整頻段已造成 {floor:.3f} dB 低處 RMS，超過 {limit:.3f} dB 上限；請提高容許量或改成重新計算。")
+        floor = min(floor, limit)
+    else:
+        target, reference = _target_reference(measurements, s)
+    labels = ("保護低處", "平衡精修", "充分精修") if s["objective_mode"] == "shape" else ("保護低處", "平衡削峰", "充分削峰")
+    candidates, reference_metrics = [], None
+    last_progress = 0.
+
+    def report(value):
+        nonlocal last_progress
+        if progress:
+            last_progress = max(last_progress, min(1., max(0., value)))
+            progress(last_progress)
+
+    for index, (fraction, title) in enumerate(zip((.35, .65, 1.), labels)):
+        cap = floor + (limit - floor) * fraction
+        fit_settings = {**s, "target_level":target, "low_cut_limit_db":cap}
+        result = generate_peq(measurements, fit_settings,
+                              lambda value, i=index: report((i + value) / 3), cancel, base_peq=base_peq)
+        _cancelled(cancel)
+        result["target_reference"] = deepcopy(reference)
+        result["settings"]["target_level"] = s["target_level"]
+        target_rationale = (f"自動目標固定參考 {s['target_ref_min']:g}–{s['target_ref_max']:g} Hz；" + reference["statistic"] + "。") if reference["mode"] == "fixed_reference" else "目標水平由使用者指定或從保留方案繼承，不另行估算。"
+        result["rationale"][1] = target_rationale
+        result["comparison_context"] = dict(target_fixed_across_candidates=True, target_level_db=target,
+                                            target_source_mode=reference["mode"], low_cut_limit_db=cap,
+                                            requested_max_low_cut_db=limit, budget_fraction=fraction,
+                                            frozen_low_cut_floor_db=floor)
+        # A looser cap contains the preceding feasible solution. Retaining that
+        # incumbent prevents a weaker finite search from regressing the primary
+        # objective. Its historical search is not relabelled as the new search.
+        if candidates and result["explanation"]["summary"]["after"]["primary_rms_db"] > candidates[-1]["metrics"]["primary_rms_db"] + 1e-9:
+            previous = candidates[-1]["result"]
+            original_attempt = result
+            result = evaluate_peq(measurements, fit_settings, previous["filters"], target)
+            result["settings"]["target_level"] = s["target_level"]
+            result["target_reference"] = deepcopy(reference)
+            result["comparison_context"] = original_attempt["comparison_context"]
+            result["allocation"] = deepcopy(previous["allocation"])
+            result["allocation"]["reused_variant_key"] = candidates[-1]["key"]
+            result["allocation"]["attempted_search"] = original_attempt["allocation"]
+            result["allocation"]["skipped"].append("本策略搜尋未改善較嚴格策略的已知解，保留該可行參數；繼承的搜尋紀錄仍屬原策略。")
+            result["metrics"].update(manual_edit=False, objective_evaluations=original_attempt["metrics"]["objective_evaluations"], elapsed_seconds=original_attempt["metrics"]["elapsed_seconds"])
+            result["rationale"] = [target_rationale, "本策略提高容許量後未找到更好的主指標，沿用前一策略的可行參數；不是另一組全域最優解。"]
+            result["warnings"] = list(dict.fromkeys(result["warnings"] + original_attempt["warnings"]))
+            frozen_counts = previous["allocation"].get("frozen_counts", {})
+            result["explanation"] = explain_peq(measurements, result["settings"], result["filters"], target, frozen_counts=frozen_counts)
+            result["explanation"]["cost_provenance"] = "current_policy_reused_feasible_solution"
+        explanation = result["explanation"]
+        if reference_metrics is None:
+            reference_metrics = dict(summary=deepcopy(explanation["summary"]["before"]),
+                                     positions=[{**{k:p[k] for k in ("id", "channel", "position", "weight")}, **p["before"]} for p in explanation["positions"]])
+        violations = [dict(id=p["id"], channel=p["channel"], position=p["position"], value_db=p["after"]["below_target_cut_rms_db"], limit_db=cap)
+                      for p in explanation["positions"] if p["after"]["below_target_cut_rms_db"] > cap + 1e-6]
+        if violations:
+            raise ValueError(title + " 的取整後方案超出低處 RMS 限制，沒有保存不完整版本。")
+        count = sum(b.get("enabled", True) and abs(b["gain"]) >= .05 for bands in result["filters"].values() for b in bands)
+        purpose = f"低處額外減益容許量 {cap:.3f} dB RMS；在此限制內降低" + ("殘留波峰與具支持低處誤差。" if s["objective_mode"] == "shape" else "殘留波峰。")
+        candidates.append(dict(key=f"candidate_{index+1}", title=title, result=result, purpose=purpose,
+                               within_limit=True, pareto=True, is_recommended=False, recommendation_eligible=count > 0,
+                               low_cut_limit_db=cap, budget_fraction=fraction, limit_violations=[],
+                               metrics=deepcopy(explanation["summary"]["after"]), active_band_count=count,
+                               profile_scales=[], notes=[purpose, "每組獨立完整替換；低處上限在求解過程中檢查，含保留 Band，不含前級。"] ))
+    # Keep three slots even when their filter parameters coincide; the budgets
+    # and search records remain distinct and available in the saved version.
+    for c in candidates:
+        c["identical_to"] = [other["key"] for other in candidates if other is not c and other["result"]["filters"] == c["result"]["filters"]]
+        c["pareto"] = not any(other is not c and all(other["metrics"][field] <= c["metrics"][field] + 1e-9 for field in ("primary_rms_db", "worst_below_target_cut_rms_db")) and any(other["metrics"][field] < c["metrics"][field] - 1e-9 for field in ("primary_rms_db", "worst_below_target_cut_rms_db")) for other in candidates)
+    report(1.)
+    return dict(schema_version=2, candidates=candidates, target_level=target, target_reference=reference,
+                low_cut_limit_db=limit, frozen_low_cut_floor_db=floor, reference_metrics=reference_metrics,
+                selected_key=candidates[0]["key"], recommended_key="", has_feasible_candidate=True,
+                objective_mode=s["objective_mode"], comparison_scope="同一 PEQ 版本內三個 RMS 容許量策略；有限搜尋，不保證全域最優。",
+                metric_axes=["primary_rms_db", "worst_below_target_cut_rms_db"], titles_monotone=True,
+                notes=["三組共用 Baseline、目標與設備能力，低處 RMS 容許量為 35%、65%、100%。比例是可檢驗的產品預設，不是聲學標準。",
+                       "保留擴充時，從既有完整 EQ 的低處 RMS 起算剩餘容許量；不能先降低目標或改寫保留參數。",
+                       "三組一同保存在一個 PEQ 版本，切換方案不表示已套用。"])

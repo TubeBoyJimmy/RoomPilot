@@ -97,7 +97,7 @@ ApplicationWindow {
                     }
                 }
                 RPButton { text: "REW 官方網站  ↗"; variant: "ghost"; compact: true; Layout.fillWidth: true; Layout.topMargin: 6; onClicked: bridge.openLink("rew") }
-                Text { text: "LOCAL WORKSPACE  ·  v0.3"; font.family: "Segoe UI"; color: "#536c81"; font.pixelSize: 9; Layout.alignment: Qt.AlignHCenter; Layout.bottomMargin: 3 }
+                Text { text: "LOCAL WORKSPACE  ·  v0.4"; font.family: "Segoe UI"; color: "#536c81"; font.pixelSize: 9; Layout.alignment: Qt.AlignHCenter; Layout.bottomMargin: 3 }
             }
         }
         ColumnLayout {

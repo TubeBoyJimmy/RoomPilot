@@ -90,7 +90,7 @@ ScrollView {
                                     ColumnLayout {
                                         Layout.fillWidth:true; spacing:7
                                         Text { text:modelData.name || "PEQ 方案"; color:"#d8e8f1"; font.pixelSize:14; font.weight:Font.DemiBold; Layout.fillWidth:true; wrapMode:Text.WordWrap }
-                                        Text { text:"Baseline v" + (modelData.baseline_version || 1) + " · " + app.statusLabel(modelData.status); color:"#81b9ac"; font.pixelSize:10 }
+                                        Text { text:"Baseline v" + (modelData.baseline_version || 1) + " · " + (modelData.variant_count > 1 ? modelData.variant_count + " 種策略 · " + (modelData.has_applied_variant ? "含已套用紀錄" : "尚未套用") : app.statusLabel(modelData.status)); color:"#81b9ac"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap }
                                         Text { text:app.formatTime(modelData.created_at); color:"#708da6"; font.pixelSize:10 }
                                     }
                                     RPButton { objectName:"openPeq_" + modelData.id; text:"查看 →"; compact:true; variant:"ghost"; onClicked:{bridge.selectPeq(modelData.id);app.go(2)} }

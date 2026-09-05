@@ -61,8 +61,8 @@ class ProjectStore:
     def save(self, project: dict) -> None:
         project["updated_at"] = timestamp()
         encoded = json.dumps(project, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        self.connection.execute("INSERT INTO projects(id,name,updated_at,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at,data=excluded.data", (project["id"], project["name"], project["updated_at"], zlib.compress(encoded)))
-        self.connection.commit()
+        with self.connection:
+            self.connection.execute("INSERT INTO projects(id,name,updated_at,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at,data=excluded.data", (project["id"], project["name"], project["updated_at"], zlib.compress(encoded)))
 
     def load(self, project_id: str) -> dict:
         row = self.connection.execute("SELECT data FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -282,7 +282,7 @@ class ProjectStore:
             if not isinstance(filters, dict) or not filters or not set(filters).issubset({"Shared", "L", "R"}) or ("Shared" in filters and len(filters) != 1):
                 raise ValueError("PEQ 的聲道濾波器設定無效。")
             for bands in filters.values():
-                if not isinstance(bands, list) or len(bands) > 20:
+                if not isinstance(bands, list) or len(bands) > 128:
                     raise ValueError("PEQ Band 資料無效。")
                 for band in bands:
                     if not isinstance(band, dict) or not all(finite(band.get(key)) for key in ("frequency", "gain", "q")) or band["frequency"] <= 0 or band["q"] <= 0 or type(band.get("enabled", True)) is not bool or band.get("type", "PK") != "PK":
@@ -308,6 +308,38 @@ class ProjectStore:
                     raise ValueError("PEQ 驗證曲線格式無效。")
                 for curve in check_curves:
                     arrays(curve, "PEQ 驗證曲線")
+        groups = {}
+        group_fields = {"group_id", "group_name", "group_fingerprint", "group_default_variant_key", "variant_key", "variant_title", "variant_order"}
+        for peq in project["peqs"]:
+            if not group_fields.intersection(peq):
+                continue
+            if not group_fields.issubset(peq) or not all(isinstance(peq[k], str) and peq[k] for k in group_fields - {"variant_order"}):
+                raise ValueError("PEQ 策略群組資料不完整。")
+            if peq["group_id"] in peq_ids or peq["group_name"] != peq["name"] or type(peq["variant_order"]) is not int:
+                raise ValueError("PEQ 策略群組名稱或順序無效。")
+            digest = peq["group_fingerprint"]
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("PEQ 策略群組校驗碼無效。")
+            groups.setdefault(peq["group_id"], []).append(peq)
+        for members in groups.values():
+            keys = {q["variant_key"] for q in members}
+            if len(members) != 3 or len(keys) != 3 or {q["variant_order"] for q in members} != {0, 1, 2}:
+                raise ValueError("PEQ 策略群組必須包含三種不同策略與完整順序。")
+            for field in ("group_name", "group_fingerprint", "group_default_variant_key", "baseline_version", "target_level", "extension_source_id", "deleted_at"):
+                if len({q.get(field) for q in members}) != 1:
+                    raise ValueError("PEQ 策略群組的基準、來源或回收區狀態不一致。")
+            if members[0]["group_default_variant_key"] not in keys:
+                raise ValueError("PEQ 策略群組的預設策略不存在。")
+            for member in members:
+                selection = member.get("candidate_selection")
+                if not isinstance(selection, dict) or selection.get("schema_version") != 2 or selection.get("selected_key") != member["variant_key"]:
+                    raise ValueError("PEQ 策略群組的比較紀錄無效。")
+                candidates = selection.get("candidates")
+                if not isinstance(candidates, list) or len(candidates) != 3 or any(not isinstance(c, dict) for c in candidates) or {c.get("key") for c in candidates} != keys:
+                    raise ValueError("PEQ 策略群組的比較紀錄不完整。")
+                entry = next(c for c in candidates if c["key"] == member["variant_key"])
+                if entry.get("title") != member["variant_title"]:
+                    raise ValueError("PEQ 策略名稱與比較紀錄不一致。")
         current = project.get("current_applied_peq_id", "")
         if not isinstance(current, str) or (current and (current not in peqs or peqs[current]["status"] != "applied")):
             raise ValueError("目前套用的 PEQ 參照不存在或尚未套用。")

@@ -8,6 +8,7 @@ ColumnLayout {
     property var explanation:result.explanation || ({})
     property var before:(explanation.summary || {}).before || ({})
     property var after:(explanation.summary || {}).after || ({})
+    property bool shapeMode: ((explanation.evaluation_policy || {}).objective_mode || (result.settings || {}).objective_mode) === "shape"
     property bool showPositions:false
     property bool showRmse:false
     spacing:10
@@ -20,9 +21,9 @@ ColumnLayout {
             ColumnLayout {
                 id:peakContent
                 anchors.left:parent.left; anchors.right:parent.right; anchors.top:parent.top; anchors.margins:12; spacing:5
-                Text { text:"殘留波峰"; color:"#94adbf"; font.pixelSize:11 }
-                Text { text:app.num(panel.after.residual_peak_rms_db,2) + " dB RMS"; color:"#d2e2ed"; font.pixelSize:18; font.family:"Segoe UI"; font.weight:Font.DemiBold }
-                Text { text:"原始 " + app.num(panel.before.residual_peak_rms_db,2) + " dB RMS"; color:"#7997ae"; font.pixelSize:10 }
+                Text { text:panel.shapeMode ? "有支持頻點的修正誤差" : "殘留波峰"; color:"#94adbf"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
+                Text { text:app.num(panel.shapeMode ? panel.after.primary_rms_db : panel.after.residual_peak_rms_db,2) + " dB RMS"; color:"#d2e2ed"; font.pixelSize:18; font.family:"Segoe UI"; font.weight:Font.DemiBold }
+                Text { text:"原始 " + app.num(panel.shapeMode ? panel.before.primary_rms_db : panel.before.residual_peak_rms_db,2) + " dB RMS"; color:"#7997ae"; font.pixelSize:10 }
             }
         }
         Rectangle {
@@ -36,7 +37,7 @@ ColumnLayout {
             }
         }
     }
-    Text { visible:!!explanation.summary; text:"殘留波峰使用整個校正頻段；額外減益只取原先低於目標的頻點。分母不同，不能相加；位置最大 RMS 也不是單一頻點的最大衰減。"; color:"#7997ae"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
+    Text { visible:!!explanation.summary; text:panel.shapeMode ? "精修誤差計入殘留波峰與具多位置支持的寬低處；深窄凹洞不因此獲得增益。殘留波峰另為 " + app.num(panel.after.residual_peak_rms_db,2) + " dB RMS。額外減益只取原先低於目標的頻點，與主目標不能相加。" : "殘留波峰使用整個校正頻段；額外減益只取原先低於目標的頻點。分母不同，不能相加；位置最大 RMS 也不是單一頻點的最大衰減。"; color:"#7997ae"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
     Text { visible:!explanation.summary; text:"此舊版本未保存這兩項可讀指標；可產生新候選重新分析。"; color:"#9ab0c0"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
     RowLayout {
         Layout.fillWidth:true; spacing:10

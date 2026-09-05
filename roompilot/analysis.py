@@ -18,14 +18,16 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 
-ALGORITHM_VERSION = "roompilot-peq-3.0"
+ALGORITHM_VERSION = "roompilot-peq-4.0"
 DEFAULTS = dict(bands=5, independent=True, f_min=30.0, f_max=200.0,
                 max_cut=6.0, max_total_cut=9.0, min_q=0.4, max_q=6.0,
                 gain_step=0.1, freq_step=1.0, q_step=0.01,
                 target_level=None, mode="deep", allow_boost=False,
                 max_boost=3.0, allow_extended=False, sample_rate=48000.0,
                 target_ref_min=80.0, target_ref_max=200.0,
-                strategy="bass_first", bass_drift_limit_db=0.5, overshoot_scale=1.0)
+                strategy="bass_first", bass_drift_limit_db=0.5, overshoot_scale=1.0,
+                objective_mode="legacy", low_cut_limit_db=1.0,
+                supports_preamp=True, preamp_margin_db=0.5, max_total_boost=3.0)
 GRID_PPO = 192
 
 
@@ -175,9 +177,9 @@ def quality_report(measurements, settings=None) -> list[dict]:
 
 def _settings(settings):
     s = {**DEFAULTS, **(settings or {})}
-    if not isinstance(s["bands"], int) or isinstance(s["bands"], bool) or not 1 <= s["bands"] <= 20:
-        raise ValueError("Band 數必須為 1–20 的整數。")
-    for key in ("independent", "allow_boost", "allow_extended"):
+    if not isinstance(s["bands"], int) or isinstance(s["bands"], bool) or not 1 <= s["bands"] <= 128:
+        raise ValueError("本次搜尋 Band 上限必須為 1–128 的整數；128 為運算資源上限，不是設備限制。")
+    for key in ("independent", "allow_boost", "allow_extended", "supports_preamp"):
         if not isinstance(s[key], bool):
             raise ValueError(key + " 必須為布林值。")
     for key in ("f_min", "f_max", "max_cut", "max_total_cut", "min_q", "max_q", "gain_step", "freq_step", "q_step", "max_boost", "sample_rate", "target_ref_min", "target_ref_max"):
@@ -194,6 +196,17 @@ def _settings(settings):
     if not _number(s["overshoot_scale"]) or not 0 <= s["overshoot_scale"] <= 1:
         raise ValueError("額外削減成本倍率必須為 0–1 的有限數值。")
     s["overshoot_scale"] = float(s["overshoot_scale"])
+    if s["objective_mode"] not in ("legacy", "peak", "shape"):
+        raise ValueError("計算目標必須為 legacy、peak 或 shape。")
+    for key in ("low_cut_limit_db", "preamp_margin_db"):
+        if not _number(s[key]) or not 0 <= s[key] <= 6:
+            raise ValueError(key + " 必須為 0–6 dB 的有限數值。")
+        s[key] = float(s[key])
+    if not _number(s["max_total_boost"]) or not 0 < s["max_total_boost"] <= 12:
+        raise ValueError("合成增益上限必須大於 0 且不超過 12 dB。")
+    s["max_total_boost"] = float(s["max_total_boost"])
+    if s["allow_boost"] and not s["supports_preamp"]:
+        raise ValueError("允許增益需要可設定前級衰減；請確認 DSP 能力或關閉增益。")
     if not 10 <= s["target_ref_min"] < s["target_ref_max"] < s["sample_rate"] / 2:
         raise ValueError("目標參考頻段需為遞增的有效範圍，且低於模擬取樣率的一半。")
     if not 8000 <= s["sample_rate"] <= 768000 or not 10 <= s["f_min"] < s["f_max"] < s["sample_rate"] / 2:
@@ -352,6 +365,9 @@ def _desired_model(grid, ys, target, s, boost_allowed):
 
 
 def _objective(grid, ys, target, s, bands, weights, boost_allowed):
+    if s.get("objective_mode", "legacy") != "legacy":
+        from .solver import objective_components
+        return objective_components(grid, ys, target, s, bands, weights, boost_allowed)
     desired, over_weight, support, _ = _desired_model(grid, ys, target, s, boost_allowed)
     response = filter_response(grid, bands, s["sample_rate"])
     error = response[None, :] - desired
@@ -363,6 +379,17 @@ def _objective(grid, ys, target, s, bands, weights, boost_allowed):
     return dict(value=fit + overshoot + effort + unsupported + complexity,
                 correction_error=fit, overshoot=overshoot, effort=effort,
                 unsupported_boost=unsupported, complexity=complexity)
+
+
+def _evaluation_policy(s):
+    return dict(algorithm_version=ALGORITHM_VERSION, overshoot_scale=s["overshoot_scale"],
+                objective_mode=s["objective_mode"], low_cut_limit_db=s["low_cut_limit_db"],
+                hard_low_cut_constraint=s["objective_mode"] != "legacy",
+                preamp_in_objective=False)
+
+
+def _combined_boost_limit(s):
+    return (s["max_boost"] if s["objective_mode"] == "legacy" else s["max_total_boost"]) if s["allow_boost"] else 0.
 
 
 def _boundary_flags(band, s):
@@ -410,7 +437,7 @@ def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None):
         fields = ("residual_peak_rms_db", "below_target_cut_rms_db", "below_target_bin_count", "total_bin_count")
         position_rows.append({**{k:p[k] for k in ("id", "channel", "position", "weight")},
                               "before":{k:b[k] for k in fields}, "after":{k:p[k] for k in fields}})
-    band_rows = []
+    band_rows, native_before, native_after = [], [], []
     for key, bands in filters.items():
         ids = [i for i, (ch, _) in enumerate(names) if key == "Shared" or ch == key]
         subset_names = [names[i] for i in ids]
@@ -418,6 +445,8 @@ def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None):
         positions_by_channel = {ch:{pos for cc, pos in subset_names if ch == cc} for ch, _ in subset_names}
         boost_ready = s["allow_boost"] and s["min_q"] <= 2 and all({"P0", "P-10", "P+10"}.issubset(ps) for ps in positions_by_channel.values())
         cost = _objective(grid, ys[ids], target, s, bands, weights, boost_ready)
+        native_before.append(_objective(grid, ys[ids], target, s, [], weights, boost_ready)["value"])
+        native_after.append(cost["value"])
         for index, band in enumerate(bands):
             remaining = bands[:index] + bands[index + 1:]
             removed = {**filters, key:remaining}
@@ -433,15 +462,19 @@ def _explain_peq(grid, ys, names, target, s, filters, frozen_counts=None):
                                   with_band=deepcopy(after), without_band=_metric_snapshot(grid, ys, names, target, removed, s["sample_rate"]),
                                   native_cost=dict(with_band=cost, without_band=without_cost,
                                                    benefit={k:without_cost[k] - cost[k] for k in cost}, unit="objective")))
+    if s["objective_mode"] != "legacy":
+        before["summary"]["primary_rms_db"] = float(np.sqrt(np.mean(native_before)))
+        after["summary"]["primary_rms_db"] = float(np.sqrt(np.mean(native_after)))
     return dict(schema_version=1, target_level_db=target,
                 cost_provenance="current_policy_manual_evaluation",
-                evaluation_policy=dict(algorithm_version=ALGORITHM_VERSION, overshoot_scale=s["overshoot_scale"]),
+                evaluation_policy=_evaluation_policy(s),
                 grid=dict(f_min=float(grid[0]), f_max=float(grid[-1]), points=len(grid), spacing="globally anchored log2; 192 points/octave plus endpoints",
                           averaging="同聲道同位置在對數頻率軸插值後以 dB 平均；診斷使用未平滑 SPL"),
                 definitions=dict(residual_peak_rms_db="sqrt(mean(max(raw_SPL+EQ-target,0)^2)); 分母為全部頻點",
                                  below_target_cut_rms_db="sqrt(mean(max(-EQ,0)^2 | raw_SPL<target)); 分母只含原先低於目標頻點，空集合回 0 並顯示數量",
                                  worst_below_target_cut_rms_db="所有已量聲道／位置的 conditional 低處新增削減 RMS 最大值",
-                                 native_cost="本策略的無單位排序成本；不是 dB、聽感或實測改善，不能跨策略比較成本大小"),
+                                 native_cost="既有策略為無單位成本；v4 削峰／精修為主指標的平方（dB²），沒有 Band 數罰分；都不是聽感分數。",
+                                 primary_rms_db="削峰模式＝殘留波峰 RMS；增減益精修＝殘留波峰及具多位置寬頻支持之低處誤差的加權 RMS；前級不進入目標"),
                 weighting=dict(policy="聲道等權；各聲道有 P0 與偏移時 P0 67%、偏移共 33%；只有一類位置則在該聲道內等權；總 RMS 為加權平方平均後開根號",
                                positions=[{k:p[k] for k in ("id", "channel", "position", "weight")} for p in after["positions"]]),
                 positions=position_rows, summary=dict(before=before["summary"], after=after["summary"]), bands=band_rows,
@@ -483,7 +516,7 @@ def explain_peq(measurements, settings, filters, target_level, *, frozen_counts=
                 raise ValueError("保存的濾波器含無效 biquad 參數，無法產生診斷。")
     explanation = _explain_peq(grid, ys, names, s["target_level"], s, filters, frozen_counts)
     explanation["cost_provenance"] = "posthoc_current_policy"
-    explanation["evaluation_policy"] = dict(algorithm_version=ALGORITHM_VERSION, overshoot_scale=s["overshoot_scale"])
+    explanation["evaluation_policy"] = _evaluation_policy(s)
     explanation["notes"].append("成本是以目前評估政策事後重算，不代表舊版產生當時的成本或取捨；保存參數未取整、未重算。")
     return explanation
 
@@ -765,7 +798,7 @@ def _validate_base_peq(base, s, expected_keys):
                     raise ValueError(f"{key} 原 Band 的 {field} 不符合本次限制或步進；延伸模式不會自動取整改寫原參數。")
         grid = np.unique(np.r_[np.geomspace(1, s["sample_rate"] / 2 * .99999, 16384), [b["frequency"] for b in bands]])
         response = filter_response(grid, bands, s["sample_rate"])
-        if response.min(initial=0) < -s["max_total_cut"] - 1e-6 or response.max(initial=0) > (s["max_boost"] if s["allow_boost"] else 0.) + 1e-6:
+        if response.min(initial=0) < -s["max_total_cut"] - 1e-6 or response.max(initial=0) > _combined_boost_limit(s) + 1e-6:
             raise ValueError(f"{key} 原方案已超過本次總 Gain 限制，不能在保持原值的條件下延伸。")
     return old
 
@@ -776,6 +809,10 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
     _cancelled(cancel)
     measurements = list(measurements)
     s = _settings(settings)
+    fit_function = _fit
+    if s["objective_mode"] != "legacy":
+        from .solver import fit_strategy
+        fit_function = fit_strategy
     if any(m.get("applied_peq_id") or m.get("role") == "verification" for m in measurements):
         raise ValueError("PEQ 必須由原始 Baseline 計算。補錄用來驗證，不能直接疊加新的濾波器。")
     report = quality_report(measurements, s)
@@ -833,8 +870,14 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
         elif s["strategy"] == "bass_first" and low < 200 < high:
             bass_grid = _log_grid(low, 200.)
             bass_ys, bass_names, _ = _group_curves(usable, bass_grid)
-            frozen, count, info = _fit(bass_grid, bass_ys[ids], target, {**s, "f_max": 200.}, boost_ready,
-                                       cancel, lambda v: callback(v * .65), names=[bass_names[i] for i in ids])
+            if s["objective_mode"] == "legacy":
+                frozen, count, info = fit_function(bass_grid, bass_ys[ids], target, {**s, "f_max": 200.}, boost_ready,
+                                                  cancel, lambda v: callback(v * .65), names=[bass_names[i] for i in ids])
+            else:
+                # Account for the whole requested domain and all filter tails
+                # from the first stage; only the first-stage centres are <=200.
+                frozen, count, info = fit_function(grid, ys[ids], target, s, boost_ready,
+                                                  cancel, lambda v: callback(v * .65), names=subset_names, center_max=200.)
             evals += count
             stages.append(dict(name="低頻優先", band_count=len(frozen), f_min=low, f_max=200., objective_evaluations=count, search=info))
             skipped.extend(info["skipped"])
@@ -847,7 +890,7 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                 reason_codes.append("no_budget" if slots <= 0 else "no_extension_range")
             else:
                 center_min = (math.floor(boundary / s["freq_step"] + 1e-9) + 1) * s["freq_step"]
-                additions, count, info = _fit(grid, ys[ids], target, s, boost_ready, cancel,
+                additions, count, info = fit_function(grid, ys[ids], target, s, boost_ready, cancel,
                                              lambda v: callback(.65 + .35 * v), names=subset_names,
                                              frozen=frozen, center_min=center_min, slots=slots, protect_grid=protected)
                 evals += count
@@ -855,7 +898,7 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                 reason_codes.extend(info["reason_codes"])
                 stages.append(dict(name="使用剩餘 Band 延伸", band_count=len(additions), f_min=center_min, f_max=high, objective_evaluations=count, merges=info["merges"], search=info))
         else:
-            additions, evals, info = _fit(grid, ys[ids], target, s, boost_ready, cancel, callback, names=subset_names)
+            additions, evals, info = fit_function(grid, ys[ids], target, s, boost_ready, cancel, callback, names=subset_names)
             stages.append(dict(name="整體重算" if s["strategy"] == "joint" else "低頻優先", band_count=len(additions), objective_evaluations=evals, merges=info["merges"], search=info))
             skipped.extend(info["skipped"])
             reason_codes.extend(info["reason_codes"])
@@ -883,6 +926,15 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                                   desired="cut-only: -clip(max(smoothed_SPL-target-0.25,0),0,max_total_cut); supported broad boost only when explicitly allowed",
                                   smoothing="1/48 octave Gaussian; 192 points/octave", channels=objectives, overshoot_scale=s["overshoot_scale"],
                                   thresholds="權重、0.25 dB 容差、Band 成本及曲線變化上限是可檢驗的產品啟發式，不是聲學標準")
+    if s["objective_mode"] != "legacy":
+        evaluated["objective"].update(
+            mode=s["objective_mode"],
+            formula="weighted mean(max(raw_SPL + EQ - target, 0)^2) + supported_deficit_MSE (shape only)",
+            desired="直接降低殘留波峰；精修模式另計具多位置寬頻支持之低處誤差。",
+            smoothing="主削峰指標使用原始 dB 曲線；增益支持判斷沿用 1/48 octave 平滑。",
+            hard_constraints=dict(low_cut_limit_db=s["low_cut_limit_db"], max_bands=s["bands"],
+                                  max_total_cut_db=s["max_total_cut"], max_total_boost_db=_combined_boost_limit(s)),
+            thresholds="Band 數是上限，沒有每段固定罰分。有限搜尋以 0.005 dB 主 RMS 改善作新增起始門檻；不是可聽差異標準。")
     evaluated["allocation"] = dict(strategy=s["strategy"], channels=allocations,
                                    frozen_counts={k: a["frozen_count"] for k, a in allocations.items()},
                                    remaining_counts={k: a["remaining_count"] for k, a in allocations.items()},
@@ -890,13 +942,16 @@ def generate_peq(measurements, settings, progress=None, cancel=None, *, base_peq
                                    skipped=[f"{k}：{reason}" for k, a in allocations.items() for reason in a["skipped"]])
     evaluated["explanation"] = _explain_peq(grid, ys, names, target, s, filters, evaluated["allocation"]["frozen_counts"])
     evaluated["explanation"]["cost_provenance"] = "current_policy_on_rounded_result"
-    evaluated["explanation"]["evaluation_policy"] = dict(algorithm_version=ALGORITHM_VERSION, overshoot_scale=s["overshoot_scale"])
+    evaluated["explanation"]["evaluation_policy"] = _evaluation_policy(s)
     rationale = [f"校正 {s['f_min']:g}–{s['f_max']:g} Hz；左右共用 {target:.2f} dB 目標，校正範圍不會改變參考範圍。",
                  (f"自動目標固定參考 P0 的 {s['target_ref_min']:g}–{s['target_ref_max']:g} Hz；" + reference["statistic"] + "。") if reference["mode"] == "fixed_reference" else "目標水平由使用者指定或從保留方案繼承，不另行估算。",
                  "同聲道同位置重錄在對數頻率軸以 dB 平均，不混合複數相位；多位置目標函數以 P0 67%、偏移位置合計 33% 加權。",
                  "擬合可實現的修正曲線；以連續額外衰減懲罰減少切過頭，不把低於目標的頻點直接判成物理凹洞。",
                  "預設以多個候選起點和聯合精修計算；只在取整後收益足夠才保留 Band。計算分數不等於聽感或實測改善。",
                  "參數已按輸入步進取整並重新驗算；這是完整替換設定，不與前一版疊加。"]
+    if s["objective_mode"] != "legacy":
+        rationale[3] = f"主目標直接使用殘留波峰{'與具支持低處' if s['objective_mode'] == 'shape' else ''}誤差；低處額外減益 {s['low_cut_limit_db']:.3f} dB RMS 在求解中逐位置約束，沒有固定 Band 罰分。"
+        rationale[4] = "搜尋涵蓋各剩餘峰與對數頻率起點，交錯新增與精修，再嘗試新增；停止表示本輪未找到達門檻的可行改善，並非全域最優。"
     for key, a in allocations.items():
         if a["protected_max_hz"] is not None:
             rationale.append(f"{key}：鎖定 {a['frozen_count']} Band，新增 {a['new_count']} Band，剩餘 {a['remaining_count']} Band；保留範圍合成曲線變化 {a['bass_drift_db']:.3f} dB（上限 {s['bass_drift_limit_db']:g} dB）。")
@@ -1012,9 +1067,21 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
                 if np.any(support < .8):
                     raise ValueError(f"{key} 的 {fc:g} Hz 增益缺少各位置一致的寬頻凹陷支持，或會填補深凹洞。")
         response = filter_response(dense, bands, s["sample_rate"])
-        if response.min(initial=0) < -s["max_total_cut"] - 1e-6 or response.max(initial=0) > (s["max_boost"] if s["allow_boost"] else 0.) + 1e-6:
+        if response.min(initial=0) < -s["max_total_cut"] - 1e-6 or response.max(initial=0) > _combined_boost_limit(s) + 1e-6:
             raise ValueError("多段濾波器疊加後超出總 Gain 限制，請減少修正幅度。")
         local = filter_response(grid, bands, s["sample_rate"])
+        if s["objective_mode"] != "legacy":
+            for i in ids:
+                below = ys[i] < target
+                low_cut = float(np.sqrt(np.mean(np.maximum(-local[below], 0.) ** 2))) if below.any() else 0.
+                if low_cut > s["low_cut_limit_db"] + 1e-6:
+                    raise ValueError(f"{names[i][0]} · {names[i][1]} 的低處額外減益 {low_cut:.3f} dB RMS 超過本策略 {s['low_cut_limit_db']:.3f} dB 上限。")
+            if enabled_boosts:
+                from .solver import _Model
+                model = _Model(grid, ys[ids], target, s, True, _position_weights([names[i] for i in ids]))
+                unsupported = ~model.support
+                if unsupported.any() and np.any(local[unsupported] > model.boost_tail_cap[unsupported] + 1e-6):
+                    raise ValueError(f"{key} 合成增益在缺少支持的頻點超過允許的尾端影響；請減少增益或調整頻寬。")
         max_gain = max(max_gain, float(response.max(initial=0)))
         max_attenuation = max(max_attenuation, -float(response.min(initial=0)))
     curves, channel_metrics, predictions = [], {}, []
@@ -1029,7 +1096,7 @@ def evaluate_peq(measurements, settings, filters, target_level=None) -> dict:
     curves.append(dict(name="目標水平", channel="Shared", kind="target", frequency=grid.tolist(), spl=[target] * len(grid)))
     before = float(np.sqrt(np.mean((ys - target) ** 2)))
     after = float(np.sqrt(np.mean((np.asarray(predictions) - target) ** 2)))
-    preamp = -math.ceil((max_gain + .5) * 10) / 10 if max_gain > .01 else 0.
+    preamp = -math.ceil((max_gain + s["preamp_margin_db"]) * 10) / 10 if max_gain > .01 else 0.
     warnings = [f"{r['title']}：{r['detail']}" for r in report if r["level"] == "warning"]
     if repeat is None:
         warnings.append("缺少同位置重錄，無法量化重現性；請先補錄 A/B。")

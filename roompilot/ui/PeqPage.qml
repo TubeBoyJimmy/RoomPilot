@@ -9,7 +9,7 @@ ScrollView {
     property var s: app.s
     property var peq: (s.candidate_preview || {}).is_draft ? s.candidate_preview : app.selectedPeq
     property bool isDraft: !!peq.is_draft
-    property var candidates: ((s.candidate_comparison || {}).candidates || []).length ? s.candidate_comparison : (peq.candidate_selection || {})
+    property var candidates: isDraft ? (s.candidate_comparison || {}) : (peq.candidate_selection || {})
     property var saved: (app.project.settings || {}).peq_settings || ({})
     property string settingsProjectId:app.project.id || ""
     onSettingsProjectIdChanged:Qt.callLater(loadLowCutLimit)
@@ -22,6 +22,7 @@ ScrollView {
     property int editIndex: 0
     property bool editingAllowed: false
     property var comparison: peq.verification || ({})
+    function versionAndStrategy() { return (peq.group_name || peq.name || "PEQ") + (peq.variant_title ? " · " + peq.variant_title : ""); }
     function currentSettings() {
         return {bands:Number(bands.text), independent:channelMode.currentIndex === 1,
             f_min:Number(fMin.text), f_max:Number(fMax.text), max_cut:Number(maxCut.text),
@@ -29,8 +30,10 @@ ScrollView {
             gain_step:Number(gainStep.text), freq_step:Number(freqStep.text), q_step:Number(qStep.text),
             target_level:target.text.trim() ? Number(target.text) : null,
             target_ref_min:Number(targetRefMin.text), target_ref_max:Number(targetRefMax.text),
-            strategy:["bass_first","extend_existing","joint"][strategyChoice.currentIndex], bass_drift_limit_db:0.5,
+            strategy:extendExisting.checked ? "extend_existing" : protectBass.checked ? "bass_first" : "joint", bass_drift_limit_db:0.5,
             mode:searchMode.currentIndex === 1 ? "deep" : "standard", allow_boost:allowBoost.checked,
+            objective_mode:allowBoost.checked ? "shape" : "peak", supports_preamp:supportsPreamp.checked,
+            preamp_margin_db:Number(preampMargin.text), max_total_boost:Number(totalBoost.text),
             max_boost:Number(maxBoost.text), allow_extended:allowExtended.checked, sample_rate:Number(sampleRate.text)};
     }
     function filterRows() {
@@ -59,7 +62,12 @@ ScrollView {
             withSummary=withSummary.after || withSummary;withoutSummary=withoutSummary.after || withoutSummary;
             lines.push("", "此段的收益與代價", "殘留波峰，全部已量位置（無此段 → 有此段）：", app.num(withoutSummary.residual_peak_rms_db,3) + " → " + app.num(withSummary.residual_peak_rms_db,3) + " dB RMS", "原低點額外減益，各位置 RMS 最大值：", app.num(withoutSummary.worst_below_target_cut_rms_db,3) + " → " + app.num(withSummary.worst_below_target_cut_rms_db,3) + " dB RMS", "兩項指標的分母不同，不可把收益與代價直接相加。");
             var native=band.native_cost || {}, costsWith=(native.with_band || {}).components || native.with_band || {}, costsWithout=(native.without_band || {}).components || native.without_band || {}, benefit=native.benefit || {};
-            if(costsWith.value !== undefined) {
+            var objectiveMode=((peq.explanation || {}).evaluation_policy || {}).objective_mode || (peq.settings || {}).objective_mode || "legacy";
+            if(costsWith.value !== undefined && objectiveMode !== "legacy") {
+                lines.push("", "本聲道主要目標：無此段 → 有此段", app.num(Math.sqrt(Math.max(0,costsWithout.value)),4) + " → " + app.num(Math.sqrt(Math.max(0,costsWith.value)),4) + " dB RMS", "平方成本分項（dB²）", "殘留波峰平方平均：" + app.num(costsWithout.correction_error,4) + " → " + app.num(costsWith.correction_error,4));
+                if(objectiveMode === "shape") lines.push("具支持低處的誤差項：" + app.num(costsWithout.shape_deficit_mse,4) + " → " + app.num(costsWith.shape_deficit_mse,4));
+                lines.push("沒有另外加上 Band 數罰分；額外減益是逐位置限制，不是懲罰權重。", "此對照只移除這一段，未重新驗證移除後的整組限制；其他增減益段可能互相補償，不能只依單項差值判定是否應刪除。");
+            } else if(costsWith.value !== undefined) {
                 lines.push("", (peq.explanation || {}).post_hoc ? "本次事後評估的聲道成本（非 dB）" : "此方案的聲道成本（非 dB）", "不含此段：" + app.num(costsWithout.value,4), "包含此段：" + app.num(costsWith.value,4));
                 if(benefit.value !== undefined) lines.push("此段使成本" + (benefit.value >= 0 ? "下降 " : "增加 ") + app.num(Math.abs(benefit.value),4));
                 var components=[{key:"correction_error",label:"基本修正誤差"},{key:"overshoot",label:"額外削過頭懲罰"},{key:"effort",label:"修正幅度成本"},{key:"complexity",label:"Band 數成本"},{key:"unsupported_boost",label:"未獲支持的增益懲罰"}];
@@ -86,7 +94,7 @@ ScrollView {
         }
         if((peq.explanation || {}).post_hoc) lines.push("", "此為舊方案的事後計算說明；原始參數未改動。");
         bandDialog.heading=channelLabel(row.channel) + " · Band " + (row.index+1) + " 的收益與代價";
-        bandDialog.subheading=peq.name || "PEQ";bandDialog.bodyText=lines.join("\n");bandDialog.open();
+        bandDialog.subheading=page.versionAndStrategy();bandDialog.bodyText=lines.join("\n");bandDialog.open();
     }
     function channelLabel(channel) { return channel === "Shared" ? "共用" : channel === "L" ? "左 L" : channel === "R" ? "右 R" : channel; }
     function savedTargetDescription() {
@@ -102,7 +110,7 @@ ScrollView {
     function inspectComputation() {
         var settings=peq.settings || {}, metrics=peq.metrics || {}, reference=peq.target_reference || {}, allocation=peq.allocation || {}, explanation=peq.explanation || {};
         var strategyNames={bass_first:"低頻優先，再以剩餘 Band 擴充",extend_existing:"保留原方案與目標，擴充高頻",joint:"整個頻段重新最佳化"};
-        var lines=[isDraft ? "目前顯示的未儲存候選" : "目前顯示的已保存方案",peq.name || "PEQ","Baseline v" + (peq.baseline_version || 1),"計算模型：" + (peq.algorithm_version || "舊版未記錄"),"",page.savedTargetDescription(),"分配策略：" + (metrics.manual_edit ? "手動調整後驗算（不保證保留策略）" : strategyNames[settings.strategy] || "舊版搜尋策略"),"校正範圍：" + app.num(settings.f_min,0) + "–" + app.num(settings.f_max,0) + " Hz","搜尋方式：" + (metrics.manual_edit ? "手動指定參數，僅重新驗算" : settings.mode === "deep" ? "深入搜尋" : "快速／標準搜尋")];
+        var lines=[isDraft ? "目前顯示的未儲存候選" : "目前顯示的已保存方案",page.versionAndStrategy(),"Baseline v" + (peq.baseline_version || 1),"計算模型：" + (peq.algorithm_version || "舊版未記錄"),"",page.savedTargetDescription(),"計算範圍與保留方式：" + (metrics.manual_edit ? "手動調整後驗算（不保證保留策略）" : strategyNames[settings.strategy] || "舊版搜尋策略"),"校正範圍：" + app.num(settings.f_min,0) + "–" + app.num(settings.f_max,0) + " Hz","搜尋方式：" + (metrics.manual_edit ? "手動指定參數，僅重新驗算" : settings.mode === "deep" ? "深入搜尋" : "快速／標準搜尋")];
         var channels=Object.keys(peq.filters || {});
         if(reference.requested_min !== undefined && reference.requested_max !== undefined) {
             lines.push("目標參考設定：" + app.num(reference.requested_min,1) + "–" + app.num(reference.requested_max,1) + " Hz");
@@ -112,10 +120,20 @@ ScrollView {
         if(reference.statistic) lines.push("目標來源：" + reference.statistic);
         if(reference.mode === "fixed_reference") lines.push("第 35 百分位是本程式的起始估計方法，不是聲學標準；可手動指定並鎖定目標。");
         if(reference.mode === "inherited" && reference.original && reference.original.statistic) lines.push("原目標來源：" + reference.original.statistic);
-        var evaluationPolicy=explanation.evaluation_policy || {}, scale=evaluationPolicy.overshoot_scale;
+        var evaluationPolicy=explanation.evaluation_policy || {}, objectiveMode=evaluationPolicy.objective_mode || settings.objective_mode || "legacy", scale=evaluationPolicy.overshoot_scale;
         if(scale === undefined) scale=settings.overshoot_scale;
-        if(scale !== undefined) {
+        if(objectiveMode !== "legacy") {
+            lines.push("", "此方案的計算目標", objectiveMode === "shape" ? "增減益精修：降低殘留波峰與具多位置、寬頻支持的低處誤差。證據不足時不採用增益；啟用增益必須具備前級衰減能力。" : "削峰：直接降低殘留波峰 RMS，依完整校正頻段、聲道與已量位置計算。", "額外減益容許量在搜尋內逐位置限制，不是計算完成後才篩選；沒有 Band 數懲罰。", "每次新增後都可精修，停止前重新檢查增段；深入搜尋另比較同時配置多段的起點。新增最低改善 0.005 dB RMS 是產品停止門檻，不是聽覺閾值。");
+            if(evaluationPolicy.low_cut_limit_db !== undefined) lines.push("此策略的低處容許量：" + app.num(evaluationPolicy.low_cut_limit_db,3) + " dB RMS");
+            lines.push("主要目標以 dB RMS 呈現；其平方成本單位是 dB²，不是聽感分數。", "前級衰減不納入削峰目標，避免以降低整體音量當作校正收益。", "候選只有額外減益預算不同，使用相同主要目標、Baseline 與設備限制。");
+            if(settings.allow_boost) lines.push("單段增益上限：" + app.num(settings.max_boost,1) + " dB；合成增益上限：" + app.num(settings.max_total_boost,1) + " dB", "DSP 前級衰減能力：" + (settings.supports_preamp === false ? "未提供" : "已提供") + "；額外餘裕 " + app.num(settings.preamp_margin_db,1) + " dB", "建議前級衰減依完整濾波器合成峰值估算；這不代表已確認喇叭或擴大機的物理餘裕。");
+        } else if(scale !== undefined) {
             lines.push("", explanation.post_hoc ? "本次事後評估的成本設定（非舊版生成政策）" : "此方案的成本設定", "額外削過頭懲罰倍率：" + app.num(scale,2) + "（產品預設 1.00）", "成本為無單位的模型排序數值，並非 dB。", "基本平方誤差 ＋ 額外削過頭懲罰 ＋ 0.0036 × EQ 平方平均 ＋ 0.025 × 啟用 Band 數；進階增益另含未獲支持增益的懲罰。", "基本誤差針對預期修正曲線，不是主圖的平坦目標 RMSE。削過頭懲罰亦依原始曲線低於目標的幅度加權。", "0.25 dB 容差、1/48 octave 平滑、上述權重與 Band 成本均為產品設定，不是聲學標準。");
+        }
+        if(allocation.reused_variant_key) {
+            var reusedTitle=allocation.reused_variant_key, savedCandidates=(page.candidates || {}).candidates || [];
+            for(var rc=0;rc<savedCandidates.length;rc++) if(savedCandidates[rc].key === allocation.reused_variant_key) {reusedTitle=savedCandidates[rc].title || reusedTitle;break;}
+            lines.push("", "沿用更嚴策略已知解：" + reusedTitle, "下列搜尋輪次屬於原策略及原容許量。本策略較寬容許量的搜尋沒有改善已知解，因此未採用；其嘗試紀錄另外保留，不列成此結果的新增過程。");
         }
         lines.push("", "Band 分配");
         for(var i=0;i<channels.length;i++) {
@@ -132,18 +150,23 @@ ScrollView {
         for(var c=0;c<channels.length;c++) {
             var stages=((allocation.channels || {})[channels[c]] || {}).stages || [];
             for(var st=0;st<stages.length;st++) {
-                var rounds=(stages[st].search || {}).rounds || [];
+                var search=stages[st].search || {}, rounds=search.rounds || [];
                 if(!rounds.length) continue;
-                if(!hasRounds) {lines.push("", "新增 Band 輪次摘要（本方案政策的成本，非 dB）", "新增輪次之後仍有聯合精修、合併與冗餘移除檢查，最終結果可能不同。");hasRounds=true;}
+                if(!hasRounds) {lines.push("", objectiveMode === "legacy" ? "新增 Band 輪次摘要（本方案政策的成本，非 dB）" : "搜尋輪次摘要（主要目標 dB RMS）", "新增、精修與冗餘移除會交替進行；下方另列此階段最終結果。");hasRounds=true;}
                 lines.push("", page.channelLabel(channels[c]) + " · " + (stages[st].name || "搜尋階段"));
+                var branchNames={sequential:"順序路徑",simultaneous:"同時多段路徑"}, selectedBranch=search.selected_search_branch;
+                if(selectedBranch) lines.push("此階段最終採用路徑：" + (branchNames[selectedBranch] || selectedBranch), "輪次的「接受」只代表該探索路徑內的更新；未採用路徑中的更新不屬於最終方案。");
+                if(allocation.reused_variant_key && search.low_cut_limit_db !== undefined) lines.push("這份搜尋紀錄的原容許量：" + app.num(search.low_cut_limit_db,3) + " dB RMS");
                 for(var r=0;r<rounds.length;r++) {
                     var round=rounds[r], beforeRound=(round.before_cost || {}).value, nextRound=(round.candidate_cost || {}).value;
-                    lines.push("第 " + (round.round || r+1) + " 輪新增搜尋 · " + (round.accepted ? "接受" : "未接受"));
+                    var phaseNames={add_band:"新增 Band",alternate_add_band:"替代起點增段",final_reopened_add_band:"最終重新增段",refine_before_reopen:"重新增段前精修",interleaved_refinement:"增段後精修",alternate_multiband_start:"替代多段起點",remove_redundant:"移除冗餘段",final_refinement:"最終精修"};
+                    var branchLabel=round.branch ? (branchNames[round.branch] || round.branch) + (selectedBranch && round.branch !== selectedBranch ? "（未採用路徑）" : "") : "";
+                    lines.push("第 " + (round.round || r+1) + " 輪 · " + (branchLabel ? branchLabel + " · " : "") + (phaseNames[round.phase] || "搜尋") + " · " + (round.accepted ? (round.branch ? "此路徑內接受" : "接受") : "未接受"));
                     if(round.reason) lines.push("    " + round.reason);
-                    if(beforeRound !== undefined) lines.push("    原成本 " + app.num(beforeRound,4) + (nextRound !== undefined ? " → 候選 " + app.num(nextRound,4) : "；本輪沒有候選成本"));
+                    if(beforeRound !== undefined) lines.push(objectiveMode === "legacy" ? "    原成本 " + app.num(beforeRound,4) + (nextRound !== undefined ? " → 候選 " + app.num(nextRound,4) : "；本輪沒有候選成本") : "    原目標 " + app.num(Math.sqrt(Math.max(0,beforeRound)),4) + (nextRound !== undefined ? " → 候選 " + app.num(Math.sqrt(Math.max(0,nextRound)),4) : "；本輪沒有候選") + " dB RMS");
                 }
                 var finalCost=((stages[st].search || {}).final_cost || {}).value;
-                if(finalCost !== undefined) lines.push("    此階段經精修及冗餘檢查後的最終成本：" + app.num(finalCost,4));
+                if(finalCost !== undefined) lines.push(objectiveMode === "legacy" ? "    此階段經精修及冗餘檢查後的最終成本：" + app.num(finalCost,4) : "    此階段最終主要目標：" + app.num(Math.sqrt(Math.max(0,finalCost)),4) + " dB RMS");
             }
         }
         lines.push("", "計算工作量");
@@ -151,7 +174,7 @@ ScrollView {
         var elapsed=metrics.elapsed_seconds !== undefined ? metrics.elapsed_seconds : metrics.elapsed_s;
         if(elapsed !== undefined) lines.push("計算時間：" + app.num(elapsed,2) + " 秒");
         else lines.push("計算時間：此版本未記錄");
-        lines.push("", "產生時的限制", "單段減益上限：" + app.num(settings.max_cut,1) + " dB", "總減益上限：" + app.num(settings.max_total_cut,1) + " dB", "Q：" + app.num(settings.min_q,2) + "–" + app.num(settings.max_q,2), "濾波器模擬取樣率：" + app.num(settings.sample_rate,0) + " Hz", "", "搜尋次數有限；停止只表示這次搜尋沒有接受更多濾波器，不能證明不存在其他可改善的組合。", "左側設定用於產生候選；預覽不會新增專案 PEQ，選定後才儲存一個版本。");
+        lines.push("", "產生時的限制", "單段減益上限：" + app.num(settings.max_cut,1) + " dB", "總減益上限：" + app.num(settings.max_total_cut,1) + " dB", "Q：" + app.num(settings.min_q,2) + "–" + app.num(settings.max_q,2), "濾波器模擬取樣率：" + app.num(settings.sample_rate,0) + " Hz", "", "搜尋次數有限；停止只表示這次搜尋沒有接受更多濾波器，不能證明不存在其他可改善的組合。", "每次計算新增一個 PEQ 版本，內含不同取捨的策略；切換標籤即可查看各策略的完整參數。");
         if((explanation.notes || []).length) lines=lines.concat(["", "指標說明"],explanation.notes);
         computationDialog.heading="目前方案的計算依據";
         computationDialog.subheading=isDraft ? "候選預覽 · 選定後才保存" : app.formatTime(peq.created_at) + " · 每個版本分別保存設定與結果";
@@ -206,9 +229,9 @@ ScrollView {
                         id: controlsColumn
                         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 19
                         spacing: 13
-                        SectionTitle { title: "PEQ 比較設定"; subtitle: "先預覽不同取捨，選定後才儲存。"; Layout.fillWidth: true }
-                        Text { text: "可分配的 Band 數"; color: "#91a8bd"; font.pixelSize: 11; Layout.topMargin: 4 }
-                        RPField { id: bands; objectName: "peqBands"; Layout.fillWidth: true; text: String(saved.bands || 5); validator: IntValidator {bottom:1; top:20} inputMethodHints: Qt.ImhDigitsOnly }
+                        SectionTitle { title: "PEQ 設定"; subtitle: "一次產生一個版本，標籤切換不同取捨。"; Layout.fillWidth: true }
+                        Text { text: "本次最多使用的 Band 數"; color: "#91a8bd"; font.pixelSize: 11; Layout.topMargin: 4 }
+                        RPField { id: bands; objectName: "peqBands"; Layout.fillWidth: true; text: String(saved.bands || 5); validator: IntValidator {bottom:1; top:128} inputMethodHints: Qt.ImhDigitsOnly }
                         Text { text: "左右聲道的設定方式"; color: "#91a8bd"; font.pixelSize: 11 }
                         RPComboBox { id: channelMode; objectName: "peqChannelMode"; Layout.fillWidth: true; model:["左右共用一組", "左右各自設定"]; currentIndex:saved.independent ? 1 : 0 }
                         Text { text: channelMode.currentIndex === 1 ? "Band 數為每聲道可使用數量。" : "同一組濾波器會同時評估 L / R。"; color: "#708ba3"; font.pixelSize: 10; Layout.fillWidth: true; wrapMode: Text.WordWrap }
@@ -222,14 +245,15 @@ ScrollView {
                             Text { text:"—"; color:"#708ba3" }
                             RPField { id:fMax; objectName:"peqFrequencyMax"; Layout.fillWidth:true; Layout.preferredWidth:1; text:String(saved.f_max || 200); validator:DoubleValidator {bottom:10; top:20000; locale:"C"} }
                         }
-                        Text { text:"Band 分配策略"; color:"#91a8bd"; font.pixelSize:11 }
-                        RPComboBox { id:strategyChoice; objectName:"peqStrategy"; Layout.fillWidth:true; model:["低頻優先，餘額擴充", "保留原案，擴充高頻", "整段重新最佳化"]; currentIndex:saved.strategy === "extend_existing" ? 1 : saved.strategy === "joint" ? 2 : 0 }
-                        Text { text:strategyChoice.currentIndex === 1 ? (isDraft ? "請先儲存這個候選，或選取一個已儲存方案，再進行保留擴充。" : peq.id ? "保留「" + peq.name + "」的目標與全部濾波器，僅以剩餘 Band 處理原範圍以上。Band 不足時保留原方案並提示。" : "請先選取已儲存的 PEQ 作為擴充起點。") : strategyChoice.currentIndex === 2 ? "重新分配整個頻段的 Band，原本的低頻參數也可能改變。目標參考範圍仍獨立設定。" : "先處理 200 Hz 以下，再評估較高頻段。若 Band 不足，會保留低頻並提示尚未處理的區域。"; color:strategyChoice.currentIndex === 2 ? "#dfc28c" : "#708ba3"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
+                        RPCheckBox { id:extendExisting; objectName:"peqExtendExisting"; text:"沿用已選 PEQ，僅擴充頻段"; checked:saved.strategy === "extend_existing"; Layout.fillWidth:true }
+                        Text { visible:extendExisting.checked; text:peq.id && !isDraft ? "保留目前「" + page.versionAndStrategy() + "」的目標與全部濾波器，只使用剩餘 Band 處理原範圍以上。" : "請先選取一個已儲存的 PEQ 策略，作為擴充起點。"; color:"#8cabae"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
+                        RPCheckBox { id:protectBass; objectName:"peqProtectBass"; visible:Number(fMax.text) > 200 && !extendExisting.checked; text:"先完成低頻，餘額再擴充"; checked:saved.strategy !== "joint"; Layout.fillWidth:true }
+                        Text { visible:Number(fMax.text) > 200 && !extendExisting.checked; text:protectBass.checked ? "先計算 200 Hz 以下，保留結果後再處理高頻；新增 Band 對低頻的影響限制為 0.5 dB。" : "整個設定頻段共同分配 Band；低頻參數可能隨較高頻段的需求調整。"; color:protectBass.checked ? "#708ba3" : "#dfc28c"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                         Text { text: "單段最大減益（dB）"; color: "#91a8bd"; font.pixelSize: 11 }
                         RPField { id:maxCut; objectName:"peqMaxCut"; Layout.fillWidth:true; text:String(saved.max_cut || 6); validator:DoubleValidator {bottom:0.1; top:24; locale:"C"} }
                         Text { text:"原低於目標頻點的額外減益容許量（dB RMS）"; color:"#91a8bd"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
                         RPField { id:lowCutLimit; objectName:"peqLowCutLimit"; Layout.fillWidth:true; text:"1"; Component.onCompleted:page.loadLowCutLimit(); validator:DoubleValidator {bottom:0; top:6; locale:"C"} }
-                        Text { text:"比較各位置 RMS 的最大值，並非每個頻點最多下降此值。這是你選擇候選的容許門檻，不是聲學標準。"; color:"#708ba3"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
+                        Text { text:extendExisting.checked ? "延伸時先納入原案的減益，再把剩餘容許量分為三種取捨。以各位置 RMS 最大值限制，並非每個頻點最多下降此值。" : "三種取捨分別使用此容許量的 35%、65%、100% 進行計算。比較各位置 RMS 最大值，並非每個頻點最多下降此值；不是聲學標準。"; color:"#708ba3"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                         Text { text: "搜尋方式"; color: "#91a8bd"; font.pixelSize: 11 }
                         RPComboBox { id:searchMode; objectName:"peqSearchMode"; Layout.fillWidth:true; model:["快速預覽", "深入搜尋（預設）"]; currentIndex:saved.mode === "standard" ? 0 : 1 }
                         Text { text: searchMode.currentIndex === 1 ? "探索更多候選組合，等待時間較長；不保證能改善所有量測。" : "多起點搜尋與局部精修，優先處理最值得修正的凸峰。"; color:"#708ba3"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
@@ -267,11 +291,18 @@ ScrollView {
                             Text { text:"填實際 DSP 處理取樣率，勿填設備支援上限。只影響曲線模型，不會重取樣播放音訊；低頻分析可先保留 48000。"; color:"#708ba3"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                             RPCheckBox { id:allowExtended; objectName:"peqAllowExtended"; text:"允許校正 200 Hz 以上"; checked:!!saved.allow_extended; Layout.fillWidth:true }
                             RPCheckBox { id:allowBoost; objectName:"peqAllowBoost"; text:"允許增益（進階精校）"; checked:!!saved.allow_boost; Layout.fillWidth:true }
-                            RPField { id:maxBoost; visible:allowBoost.checked; Layout.fillWidth:true; text:String(saved.max_boost || 3); placeholderText:"最大增益 dB"; validator:DoubleValidator {bottom:0; top:6; locale:"C"} }
+                            RPCheckBox { id:supportsPreamp; objectName:"peqSupportsPreamp"; visible:allowBoost.checked; text:"可設定 DSP 前級衰減"; checked:saved.supports_preamp !== false; Layout.fillWidth:true }
+                            Text { visible:allowBoost.checked; text:"單段最大增益（dB）"; color:"#91a8bd"; font.pixelSize:11 }
+                            RPField { id:maxBoost; objectName:"peqMaxBoost"; visible:allowBoost.checked; Layout.fillWidth:true; text:String(saved.max_boost || 3); validator:DoubleValidator {bottom:0; top:6; locale:"C"} }
+                            Text { visible:allowBoost.checked; text:"多段合成增益上限（dB）"; color:"#91a8bd"; font.pixelSize:11 }
+                            RPField { id:totalBoost; objectName:"peqTotalBoost"; visible:allowBoost.checked; Layout.fillWidth:true; text:String(saved.max_total_boost !== undefined ? saved.max_total_boost : 3); validator:DoubleValidator {bottom:0; top:12; locale:"C"} }
+                            Text { visible:allowBoost.checked && supportsPreamp.checked; text:"前級額外餘裕（dB）"; color:"#91a8bd"; font.pixelSize:11 }
+                            RPField { id:preampMargin; objectName:"peqPreampMargin"; visible:allowBoost.checked && supportsPreamp.checked; Layout.fillWidth:true; text:String(saved.preamp_margin_db !== undefined ? saved.preamp_margin_db : 0.5); validator:DoubleValidator {bottom:0; top:6; locale:"C"} }
+                            Text { objectName:"peqBoostCapabilityHelp"; visible:allowBoost.checked; text:supportsPreamp.checked ? "增益模式會評估符合多位置證據的寬凹陷，並依完整合成曲線估算前級衰減。這只預留數位峰值空間，不能保證喇叭或擴大機的餘裕。" : "允許增益需要可設定前級衰減；請確認能力，或關閉「允許增益」。"; color:"#dfc28c"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                             Text { visible:allowBoost.checked || allowExtended.checked; text:"先取得同點補錄與左右偏移量測，再評估寬頻一致性；深窄凹洞通常不適合補償。增益方案需預留前級衰減。"; color:"#dfc28c"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                         }
-                        RPButton { objectName:"generatePeq"; text:"產生候選並比較  →"; variant:"primary"; Layout.fillWidth:true; enabled:!!s.baseline_ready && !s.busy && peakSupported.checked && lowCutLimit.acceptableInput && (strategyChoice.currentIndex !== 1 || (!!peq.id && !isDraft)); onClicked:bridge.generatePeqCandidates(JSON.stringify(page.currentSettings()),Number(lowCutLimit.text)) }
-                        Text { text:"同一目標與限制下，比較三種取捨。不強迫填滿 Band；有限搜尋未找到更多方案，不等於沒有其他改善可能。"; color:"#6f899f"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
+                        RPButton { objectName:"generatePeq"; text:"產生 PEQ  →"; variant:"primary"; Layout.fillWidth:true; enabled:!!s.baseline_ready && !s.busy && peakSupported.checked && bands.acceptableInput && lowCutLimit.acceptableInput && (!allowBoost.checked || supportsPreamp.checked) && (!extendExisting.checked || (!!peq.id && !isDraft)); onClicked:bridge.generatePeqCandidates(JSON.stringify(page.currentSettings()),Number(lowCutLimit.text)) }
+                        Text { text:"結果自動保存為一個版本，內含三種取捨。不同容許量有時會得到相同參數；更多 Band 是可用上限，不會強迫填滿。軟體 DSP 可依需求提高到 128 段，計算時間會增加。"; color:"#6f899f"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.4 }
                     }
                 }
                 ColumnLayout {
@@ -279,7 +310,12 @@ ScrollView {
                     Layout.preferredWidth:650
                     Layout.alignment:Qt.AlignTop
                     spacing:17
-                    PeqCandidateComparison { objectName:"peqCandidateComparison"; app:page.app; comparison:page.candidates; preview:page.peq; isPreview:page.isDraft; Layout.fillWidth:true; visible:(page.candidates.candidates || []).length > 0 }
+                    RowLayout {
+                        Layout.fillWidth:true; spacing:12
+                        RPComboBox { objectName:"peqVersionSelector"; Layout.fillWidth:true; model:s.peqs || []; textRole:"name"; displayText:peq.name || "尚未產生方案"; onActivated:function(index){bridge.selectPeq(model[index].id)} }
+                        Rectangle { visible:!!peq.id; implicitWidth:statusText.implicitWidth + 16; height:25; radius:6; color:"#1c373d"; Text { id:statusText; anchors.centerIn:parent; text:isDraft ? "未儲存預覽" : app.statusLabel(peq.status); color:"#83dbc5"; font.pixelSize:10 } }
+                    }
+                    PeqCandidateComparison { objectName:"peqCandidateComparison"; app:page.app; comparison:page.candidates; preview:page.peq; savedVariants:s.selected_peq_variants || []; isPreview:page.isDraft; Layout.fillWidth:true; visible:(page.candidates.candidates || []).length > 0 || (s.selected_peq_variants || []).length > 0 }
                     RPCard {
                         Layout.fillWidth:true
                         implicitHeight:curveColumn.implicitHeight + 36
@@ -288,15 +324,10 @@ ScrollView {
                             anchors.left:parent.left; anchors.right:parent.right; anchors.top:parent.top; anchors.margins:18
                             spacing:14
                             RowLayout {
-                                Layout.fillWidth:true; spacing:12
-                                RPComboBox { objectName:"peqVersionSelector"; Layout.fillWidth:true; model:s.peqs || []; textRole:"name"; displayText:peq.name || "尚未產生方案"; onActivated:function(index){bridge.selectPeq(model[index].id)} }
-                                Rectangle { visible:!!peq.id; implicitWidth:statusText.implicitWidth + 16; height:25; radius:6; color:"#1c373d"; Text { id:statusText; anchors.centerIn:parent; text:isDraft ? "未儲存預覽" : app.statusLabel(peq.status); color:"#83dbc5"; font.pixelSize:10 } }
-                                RPCheckBox { text:"低頻"; checked:true; onCheckedChanged:peqChart.lowOnly=checked }
-                            }
-                            RowLayout {
                                 visible:!!peq.id
                                 Layout.fillWidth:true; spacing:10
                                 Text { text:page.savedTargetDescription(); color:"#8da9bc"; font.pixelSize:11; Layout.fillWidth:true; wrapMode:Text.WordWrap }
+                                RPCheckBox { text:"低頻"; checked:true; onCheckedChanged:peqChart.lowOnly=checked }
                                 RPButton { objectName:"inspectPeqComputation"; text:"計算依據"; compact:true; variant:"ghost"; onClicked:page.inspectComputation() }
                             }
                             PeqReadableMetrics { objectName:"peqReadableMetrics"; visible:!!peq.id; Layout.fillWidth:true; app:page.app; result:page.peq }
@@ -372,9 +403,9 @@ ScrollView {
                                 RowLayout {
                                     id:preampRow
                                     anchors.left:parent.left; anchors.right:parent.right; anchors.top:parent.top; anchors.margins:10; spacing:12
-                                    Text { text:"前級衰減"; color:"#88bbaa"; font.pixelSize:11 }
+                                    Text { text:"DSP 前級衰減"; color:"#88bbaa"; font.pixelSize:11 }
                                     Text { text:app.num(peq.preamp_db || 0,1) + " dB"; color:"#d9f1e9"; font.pixelSize:16; font.weight:Font.DemiBold; font.family:"Segoe UI" }
-                                    Text { text:"請取代上一版參數，避免重複疊加。"; color:"#7d9eae"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; horizontalAlignment:Text.AlignRight }
+                                    Text { text:"依所有 Band 合成峰值估算。請取代上一版參數，避免重複疊加。"; color:"#7d9eae"; font.pixelSize:10; Layout.fillWidth:true; wrapMode:Text.WordWrap; horizontalAlignment:Text.AlignRight }
                                 }
                             }
                             RPButton { objectName:"markPeqApplied"; text:isDraft ? "先儲存候選，再記錄套用" : peq.status === "applied" || peq.status === "verified" ? "✓  已確認套用此版本" : "我已在 DSP 套用此版本"; variant:"primary"; Layout.fillWidth:true; enabled:!isDraft && !s.busy && peq.status !== "applied" && peq.status !== "verified"; onClicked:appliedDialog.open() }
@@ -462,7 +493,7 @@ ScrollView {
         background:Rectangle { color:"#142335"; radius:14; border.color:"#3a5063" }
         contentItem:ColumnLayout {
             spacing:16
-            SectionTitle { title:"編輯 " + page.channelLabel(page.editChannel) + " · Band " + (page.editIndex + 1); subtitle:"儲存後重新計算預測，並保留原方案供回顧。"; Layout.fillWidth:true }
+            SectionTitle { title:"編輯 " + page.channelLabel(page.editChannel) + " · Band " + (page.editIndex + 1); subtitle:"另存為新的 PEQ 版本並驗算；原版本內各策略保持原樣。"; Layout.fillWidth:true }
             RowLayout {
                 Layout.fillWidth:true; spacing:12
                 ColumnLayout { Layout.fillWidth:true; Layout.preferredWidth:1; Text { text:"頻率 Hz"; color:"#91a8bd"; font.pixelSize:11 } RPField { id:editFrequency; objectName:"editFilterFrequency"; Layout.fillWidth:true; validator:DoubleValidator {bottom:10; top:20000; locale:"C"} } }
@@ -486,7 +517,7 @@ ScrollView {
         background:Rectangle { color:"#142335"; radius:14; border.color:"#3a5063" }
         contentItem:ColumnLayout {
             spacing:17
-            SectionTitle { title:"確認 PEQ 已套用"; subtitle:peq.name || ""; Layout.fillWidth:true }
+            SectionTitle { title:"確認 PEQ 已套用"; subtitle:page.versionAndStrategy(); Layout.fillWidth:true }
             Text { text:"請核對所有聲道的頻率、Gain、Q 與前級衰減，取代舊版濾波器，並確認 DSP 已啟用。這個操作只記錄你的確認，不會直接控制音訊設備。"; color:"#a7bfd0"; font.pixelSize:12; Layout.fillWidth:true; wrapMode:Text.WordWrap; lineHeight:1.5 }
             RowLayout {
                 Layout.fillWidth:true; Item { Layout.fillWidth:true }

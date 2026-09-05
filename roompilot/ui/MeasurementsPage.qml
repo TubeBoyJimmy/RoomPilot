@@ -161,9 +161,9 @@ ScrollView {
                                     objectName: "measurementPeqAssociation"
                                     visible: roleChoice.currentIndex === 1
                                     Layout.fillWidth: true
-                                    model: s.peqs || []; textRole: "name"
-                                    currentIndex: { var rows = s.peqs || []; for(var i=0;i<rows.length;i++) if(rows[i].id === selected.applied_peq_id) return i; return rows.length ? 0 : -1; }
-                                    displayText: currentIndex >= 0 ? model[currentIndex].name : "先建立並套用 PEQ 方案"
+                                    model: s.peq_variants || []; textRole: "display_name"
+                                    currentIndex: { var rows = s.peq_variants || []; for(var i=0;i<rows.length;i++) if(rows[i].id === selected.applied_peq_id) return i; return rows.length ? 0 : -1; }
+                                    displayText: currentIndex >= 0 ? model[currentIndex].display_name : "先建立並套用 PEQ 方案"
                                 }
                                 Text { visible: roleChoice.currentIndex === 0; text: "P−10 / P+10：向左 / 右偏移 10 cm"; color: "#708da4"; font.pixelSize: 10; Layout.fillWidth: true }
                                 RPButton { objectName: "saveMeasurementClassification"; text: "儲存用途"; compact: true; enabled: !s.busy && (roleChoice.currentIndex === 0 || peqAssociation.currentIndex >= 0); onClicked: bridge.updateMeasurement(selected.id, channelChoice.currentText, positionChoice.currentText, roleChoice.currentIndex === 1 ? "verification" : "baseline", roleChoice.currentIndex === 1 && peqAssociation.currentIndex >= 0 ? peqAssociation.model[peqAssociation.currentIndex].id : "") }

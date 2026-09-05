@@ -8,6 +8,7 @@ from functools import wraps
 import json
 import math
 from pathlib import Path
+import re
 import threading
 import traceback
 import uuid
@@ -134,6 +135,60 @@ class Bridge(QObject):
 
     def _active_peqs(self):
         return [q for q in (self.project or {}).get("peqs", []) if not q.get("deleted_at")]
+
+    def _next_peq_name(self):
+        # A version can contain several strategy records. Deleted versions also
+        # reserve their number so restoring a group cannot create a collision.
+        numbers = []
+        for peq in self._need_project()["peqs"]:
+            match = re.fullmatch(r"PEQ v(\d+)", peq.get("group_name") or peq.get("name", ""))
+            if match:
+                numbers.append(int(match.group(1)))
+        return f"PEQ v{max(numbers, default=0) + 1}"
+
+    @staticmethod
+    def _peq_label(peq):
+        return peq["name"] + (" · " + peq["variant_title"] if peq.get("variant_title") else "")
+
+    def _group_members(self, peq):
+        if not peq.get("group_id"):
+            return [peq]
+        return sorted([q for q in self._need_project()["peqs"] if q.get("group_id") == peq["group_id"]],
+                      key=lambda q: q["variant_order"])
+
+    def _default_group_member(self, peq):
+        members = self._group_members(peq)
+        applied_id = self._need_project().get("current_applied_peq_id")
+        return next((q for q in members if q["id"] == applied_id),
+                    next((q for q in members if q.get("variant_key") == peq.get("group_default_variant_key")), members[0]))
+
+    def _latest_peq_id(self):
+        active = self._active_peqs()
+        return self._default_group_member(active[-1])["id"] if active else ""
+
+    def _peq_summary(self, peq):
+        summary = {k: peq.get(k) for k in ("id", "name", "created_at", "status", "baseline_version", "deleted_at",
+                                          "group_id", "group_name", "variant_key", "variant_title", "variant_order")}
+        summary.update(display_name=self._peq_label(peq), key=peq.get("variant_key", ""), title=peq.get("variant_title", ""),
+                       is_selected=peq["id"] == self._selected_peq_id)
+        selection = peq.get("candidate_selection") or {}
+        candidate = next((c for c in selection.get("candidates", []) if c.get("key") == peq.get("variant_key")), {})
+        summary.update(metrics=candidate.get("metrics", {}), low_cut_limit_db=candidate.get("low_cut_limit_db"),
+                       within_limit=candidate.get("within_limit", True))
+        return summary
+
+    def _group_summaries(self, records):
+        groups = {}
+        for peq in records:
+            groups.setdefault(peq.get("group_id") or peq["id"], []).append(peq)
+        summaries = []
+        for members in groups.values():
+            representative = next((q for q in members if q["id"] == self._selected_peq_id), self._default_group_member(members[0]))
+            summary = self._peq_summary(representative)
+            summary.update(variant_count=len(members), variant_ids=[q["id"] for q in members],
+                           has_applied_variant=any(q.get("status") == "applied" for q in members))
+            summaries.append(summary)
+        return summaries
 
     def _clear_candidates(self):
         self._candidate_comparison = {}
@@ -284,8 +339,9 @@ class Bridge(QObject):
             summary = {key: copy.deepcopy(snapshot.get(key)) for key in ("version", "created_at", "settings", "quality", "warnings_acknowledged")}
             summary["measurements"] = [self._summary(m) for m in snapshot["measurements"]]
             baseline_summaries.append(summary)
-        summaries = lambda qs: [{k: q.get(k) for k in ("id", "name", "created_at", "status", "baseline_version", "deleted_at")} for q in qs]
-        self._state = clean({"projects": self.store.list_projects(), "project": project_summary, "measurements": measurements, "selected_measurement": selected, "baselines": baseline_summaries, "peqs": summaries(self._active_peqs()), "deleted_peqs": summaries([q for q in (project or {}).get("peqs", []) if q.get("deleted_at")]), "selected_peq": copy.deepcopy(peq), "quality": self._quality_cache, "history": (project or {}).get("history", []), "devices": self._devices, "busy": self._job is not None, "progress": self._progress, "message": self._message, "message_kind": self._message_kind, "page": self._page, "chart": {"curves": display_curves, "f_min": 20, "f_max": f_max}, "peq_chart": self._gain_chart(peq), "baseline_ready": bool(project and project.get("baseline_version"))})
+        self._state = clean({"projects": self.store.list_projects(), "project": project_summary, "measurements": measurements, "selected_measurement": selected, "baselines": baseline_summaries, "peqs": self._group_summaries(self._active_peqs()), "deleted_peqs": self._group_summaries([q for q in (project or {}).get("peqs", []) if q.get("deleted_at")]), "selected_peq": copy.deepcopy(peq), "quality": self._quality_cache, "history": (project or {}).get("history", []), "devices": self._devices, "busy": self._job is not None, "progress": self._progress, "message": self._message, "message_kind": self._message_kind, "page": self._page, "chart": {"curves": display_curves, "f_min": 20, "f_max": f_max}, "peq_chart": self._gain_chart(peq), "baseline_ready": bool(project and project.get("baseline_version"))})
+        self._state["peq_variants"] = clean([self._peq_summary(q) for q in self._active_peqs()])
+        self._state["selected_peq_variants"] = clean([self._peq_summary(q) for q in self._group_members(peq)]) if peq.get("group_id") else []
         self._state["candidate_comparison"] = clean(copy.deepcopy(self._candidate_comparison))
         self._state["candidate_comparison"]["selected_key"] = self._candidate_key
         self._state["candidate_preview"] = clean(candidate_preview)
@@ -313,7 +369,7 @@ class Bridge(QObject):
         self._clear_candidates()
         self._explanation_cache = {}
         self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
-        self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
+        self._selected_peq_id = self._latest_peq_id()
         self._quality_cache = self._quality(self.project["measurements"])
         self._message = ""
         self._page = 0
@@ -577,7 +633,7 @@ class Bridge(QObject):
                 self._page = 2
                 self._refresh()
                 return
-            result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft", baseline_version=version, replaces_peq_id=prior, verification={}, verification_history=[])
+            result.update(id=str(uuid.uuid4()), name=self._next_peq_name(), created_at=timestamp(), status="draft", baseline_version=version, replaces_peq_id=prior, verification={}, verification_history=[])
             result["extension_source_id"] = (base_peq or {}).get("id")
             p["peqs"].append(result)
             p["settings"]["peq_settings"] = copy.deepcopy(result.get("settings", settings))
@@ -631,6 +687,15 @@ class Bridge(QObject):
             self._candidate_context = context
             self._candidate_key = result.get("selected_key", "")
             self._page = 2
+            if result.get("schema_version") == 2:
+                try:
+                    self._save_candidate_bundle(self._candidate_key)
+                finally:
+                    # New generations are a single durable group, never an
+                    # additional preview/save workflow or a partially saved set.
+                    self._clear_candidates()
+                    self._refresh()
+                return
             self._message = "候選已完成，尚未新增 PEQ 版本。請比較收益與代價，選定後儲存。" if result.get("has_feasible_candidate") else "本輪候選均未符合額外減益容許量；可查看原因，或調整設定後重新比較。"
             self._message_kind = "info" if result.get("has_feasible_candidate") else "warning"
             self._refresh()
@@ -661,6 +726,9 @@ class Bridge(QObject):
     @guarded
     def savePeqCandidate(self, key):
         self._not_busy()
+        if self._candidate_comparison.get("schema_version") == 2:
+            self._save_candidate_bundle(key)
+            return
         candidate = self._candidate(key)
         if not candidate.get("within_limit"):
             raise ValueError("這個候選未符合設定的低處額外減益容許量；請調整設定後重新比較。")
@@ -699,7 +767,7 @@ class Bridge(QObject):
             self._message_kind = "info"
             self._refresh()
             return
-        result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft",
+        result.update(id=str(uuid.uuid4()), name=self._next_peq_name(), created_at=timestamp(), status="draft",
                       baseline_version=context["baseline_version"], replaces_peq_id=p.get("current_applied_peq_id", ""),
                       extension_source_id=context.get("source_peq_id"), verification={}, verification_history=[])
         p["peqs"].append(clean(result))
@@ -711,6 +779,91 @@ class Bridge(QObject):
         self._message = result["name"] + " 已保存，含候選比較與各段計算依據。這是完整替換設定。"
         self._message_kind = "success"
         self._save("保存 " + result["name"], candidate["title"] + f"；低處額外減益容許量 {selection['low_cut_limit_db']:g} dB RMS，尚需補錄驗證。")
+
+    def _save_candidate_bundle(self, key):
+        """Persist every strategy in one transaction, retaining exact identities.
+
+        Build and validate a detached project first: cancelled/failed generation
+        and a failed database write cannot leave half a version in memory or disk.
+        """
+        self._candidate(key)
+        p, context = self.project, self._candidate_context
+        baseline = self._baseline(context["baseline_version"])
+        if self._fingerprint(baseline["measurements"]) != context["baseline_fingerprint"]:
+            raise ValueError("Baseline 資料已改變，請重新產生 PEQ。")
+        if context.get("source_peq_id"):
+            source = self._peq(context["source_peq_id"], include_deleted=True)
+            values = {k: source.get(k) for k in ("filters", "settings", "target_level", "baseline_version")}
+            if self._fingerprint(values) != context["source_fingerprint"]:
+                raise ValueError("擴充起點的參數已改變，請重新產生 PEQ。")
+        comparison = self._candidate_comparison
+        candidates = comparison.get("candidates", [])
+        keys = [c.get("key") for c in candidates]
+        if len(candidates) != 3 or len(set(keys)) != 3 or not all(isinstance(k, str) and k for k in keys):
+            raise ValueError("三種策略尚未全部完成，未新增 PEQ 版本。請重新產生。")
+        for item in candidates:
+            if not item.get("within_limit") or not isinstance(item.get("result"), dict):
+                raise ValueError(f"{item.get('title', '策略')} 未完成或未符合設定的容許量；整組未保存。請調整設定後重新產生。")
+        result_identity_fields = ("filters", "settings", "target_level", "preamp_db", "algorithm_version")
+        identity = {"baseline_version": context["baseline_version"], "baseline_fingerprint": context["baseline_fingerprint"],
+                    "source_peq_id": context.get("source_peq_id"), "generation_settings": context["generation_settings"],
+                    "low_cut_limit_db": comparison.get("low_cut_limit_db"),
+                    "variants": [{"key": c["key"], "title": c["title"], "low_cut_limit_db": c.get("low_cut_limit_db"),
+                                  "result": {k: c["result"].get(k) for k in result_identity_fields}}
+                                 for c in candidates]}
+        fingerprint = self._fingerprint(identity)
+        existing = [q for q in self._active_peqs() if q.get("group_fingerprint") == fingerprint]
+        def same_variant(q):
+            candidate = next((c for c in candidates if c["key"] == q.get("variant_key")), None)
+            return (candidate is not None and q.get("variant_title") == candidate["title"]
+                    and q.get("baseline_version") == context["baseline_version"]
+                    and q.get("extension_source_id") == context.get("source_peq_id")
+                    and all(q.get(k) == candidate["result"].get(k) for k in result_identity_fields))
+        if (len(existing) == 3 and {q.get("variant_key") for q in existing} == set(keys)
+                and len({q.get("group_id") for q in existing}) == 1 and all(same_variant(q) for q in existing)):
+            selected = next(q for q in existing if q["variant_key"] == key)
+            self._selected_peq_id = selected["id"]
+            self._candidate_key = ""
+            self._message = selected["name"] + " 已含相同三種策略，已選取原版本。"
+            self._message_kind = "info"
+            self._refresh()
+            return
+        group_id, group_name, created_at = str(uuid.uuid4()), self._next_peq_name(), timestamp()
+        selection = {k: copy.deepcopy(v) for k, v in comparison.items() if k != "candidates"}
+        selection.update(selected_at=created_at, baseline_version=context["baseline_version"],
+                         source_peq_id=context.get("source_peq_id"), baseline_fingerprint=context["baseline_fingerprint"],
+                         settings_fingerprint=context["settings_fingerprint"], historical=True)
+        selection["candidates"] = []
+        for item in candidates:
+            # All exact results are sibling PEQs. Avoid embedding them again in
+            # every member; these summaries are the shared comparison evidence.
+            selection["candidates"].append({k: copy.deepcopy(v) for k, v in item.items() if k != "result"})
+        results = []
+        for order, item in enumerate(candidates):
+            result = copy.deepcopy(item["result"])
+            result.update(id=str(uuid.uuid4()), name=group_name, group_id=group_id, group_name=group_name,
+                          group_fingerprint=fingerprint, group_default_variant_key=key,
+                          variant_key=item["key"], variant_title=item["title"], variant_order=order,
+                          created_at=created_at, status="draft", baseline_version=context["baseline_version"],
+                          replaces_peq_id=p.get("current_applied_peq_id", ""), extension_source_id=context.get("source_peq_id"),
+                          verification={}, verification_history=[])
+            result["candidate_selection"] = {**copy.deepcopy(selection), "selected_key": item["key"], "selected_title": item["title"]}
+            results.append(clean(result))
+        selected = next(q for q in results if q["variant_key"] == key)
+        updated = copy.deepcopy(p)
+        updated["peqs"].extend(results)
+        updated["settings"]["peq_settings"] = copy.deepcopy(context["generation_settings"])
+        updated["settings"]["peq_low_cut_limit_db"] = comparison.get("low_cut_limit_db", 1.)
+        add_history(updated, "產生 " + group_name, "保存三種策略；每種策略保留獨立套用與補錄紀錄。尚需實際補錄驗證。")
+        self.store._validate_project(updated)
+        self.store.save(updated)
+        self.project = updated
+        self._selected_peq_id = selected["id"]
+        self._candidate_key = ""
+        self._page = 2
+        self._message = group_name + " 已保存三種策略。點選標籤切換；套用與補錄只對應所選策略。"
+        self._message_kind = "success"
+        self._refresh()
 
     @Slot(str)
     @guarded
@@ -725,11 +878,15 @@ class Bridge(QObject):
     def deletePeq(self, peq_id):
         self._not_busy()
         peq = self._peq(peq_id)
-        peq["deleted_at"] = timestamp()
-        if self._selected_peq_id == peq_id:
-            self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
+        members = self._group_members(peq)
+        deleted_at = timestamp()
+        for member in members:
+            member["deleted_at"] = deleted_at
+        ids = {q["id"] for q in members}
+        if self._selected_peq_id in ids:
+            self._selected_peq_id = self._latest_peq_id()
         self._message = f"{peq['name']} 已移至回收區，可在歷程還原。"
-        if self.project.get("current_applied_peq_id") == peq_id:
+        if self.project.get("current_applied_peq_id") in ids:
             self._message += " 設備上的設定未改變，目前套用紀錄仍保留。"
         self._message_kind = "info"
         self._save("刪除 " + peq["name"], "移至可還原回收區，保留補錄及歷史關聯。")
@@ -741,7 +898,8 @@ class Bridge(QObject):
         peq = self._peq(peq_id, include_deleted=True)
         if not peq.get("deleted_at"):
             raise ValueError("此方案不在回收區。")
-        del peq["deleted_at"]
+        for member in self._group_members(peq):
+            member.pop("deleted_at", None)
         self._candidate_key = ""
         self._selected_peq_id = peq_id
         self._message = f"{peq['name']} 已還原。"
@@ -778,13 +936,13 @@ class Bridge(QObject):
         result["target_reference"] = copy.deepcopy(original.get("target_reference") or {"mode": "inherited", "level_db": original["target_level"], "statistic": "沿用舊版目標；原始估算參考未保存。"})
         result["allocation"] = {"strategy": "manual", "skipped": ["手動調整後重新驗算，不宣稱原先的凍結 Band 或裙帶容差仍成立。"]}
         result["baseline_version"] = original["baseline_version"]
-        result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft", replaces_peq_id=original["id"], verification={}, verification_history=[])
-        result["rationale"].insert(0, "由 " + original["name"] + " 手動調整；參數表是完整替換設定。")
+        result.update(id=str(uuid.uuid4()), name=self._next_peq_name(), created_at=timestamp(), status="draft", replaces_peq_id=original["id"], verification={}, verification_history=[])
+        result["rationale"].insert(0, "由 " + self._peq_label(original) + " 手動調整；參數表是完整替換設定。")
         p["peqs"].append(clean(result))
         self._selected_peq_id = result["id"]
         self._message = "手動調整已另存新版本，請重新套用並補錄驗證。"
         self._message_kind = "success"
-        self._save("手動調整 " + result["name"], f"來源 {original['name']}，保留原版。")
+        self._save("手動調整 " + result["name"], f"來源 {self._peq_label(original)}，保留原版。")
 
     @Slot(str)
     @guarded
@@ -799,7 +957,7 @@ class Bridge(QObject):
         p["current_applied_peq_id"] = peq["id"]
         self._message = "已記錄你確認套用此版完整設定。請沿用相同播放路徑、音量及 P0 位置補錄 L／R。"
         self._message_kind = "success"
-        self._save("確認已套用 " + peq["name"], "此狀態為使用者確認；尚需補錄验证。")
+        self._save("確認已套用 " + self._peq_label(peq), "此狀態為使用者確認；尚需補錄验证。")
 
     @Slot(str)
     @guarded
@@ -833,7 +991,7 @@ class Bridge(QObject):
         self._selected_peq_id = peq_id
         self._message = result.get("title", "補錄比較已完成。")
         self._message_kind = "success" if result.get("status") == "improved" else "warning"
-        self._save("驗證 " + peq["name"], result.get("title", ""))
+        self._save("驗證 " + self._peq_label(peq), result.get("title", ""))
 
     @Slot(str, str)
     @guarded
@@ -841,7 +999,7 @@ class Bridge(QObject):
         self._not_busy()
         peq = self._peq(peq_id)
         extension = "csv" if format == "csv" else "txt"
-        path, _ = QFileDialog.getSaveFileName(None, "匯出完整 PEQ 設定", peq["name"] + "." + extension, f"{extension.upper()} (*.{extension})")
+        path, _ = QFileDialog.getSaveFileName(None, "匯出完整 PEQ 設定", self._peq_label(peq) + "." + extension, f"{extension.upper()} (*.{extension})")
         if path:
             self.export_peq_to(peq_id, path, format)
             self._message = "已匯出完整參數表。匯出不代表設備已套用。"
@@ -856,9 +1014,9 @@ class Bridge(QObject):
                 writer.writerow(["方案", "Baseline", "聲道", "Band", "類型", "頻率_Hz", "Gain_dB", "Q", "啟用", "前級_dB"])
                 for channel, filters in peq["filters"].items():
                     for i, f in enumerate(filters):
-                        writer.writerow([peq["name"], peq["baseline_version"], channel, i+1, "PK", f["frequency"], f["gain"], f["q"], f.get("enabled", True), peq.get("preamp_db", 0)])
+                        writer.writerow([self._peq_label(peq), peq["baseline_version"], channel, i+1, "PK", f["frequency"], f["gain"], f["q"], f.get("enabled", True), peq.get("preamp_db", 0)])
         else:
-            lines = ["RoomPilot — 完整 PEQ 參數表", f"專案：{self.project['name']}", f"方案：{peq['name']} / Baseline v{peq['baseline_version']}", "請以這份完整設定取代上一版；請勿再疊加上一版濾波器。", "未使用的 band 請停用。PK = Peak / Bell / Peak-Dip。", "這是通用參數表，依你的 DSP 輸入欄位手動套用。", f"Preamp: {peq.get('preamp_db',0):.2f} dB", ""]
+            lines = ["RoomPilot — 完整 PEQ 參數表", f"專案：{self.project['name']}", f"方案：{self._peq_label(peq)} / Baseline v{peq['baseline_version']}", "請以這份完整設定取代上一版；請勿再疊加上一版濾波器。", "未使用的 band 請停用。PK = Peak / Bell / Peak-Dip。", "這是通用參數表，依你的 DSP 輸入欄位手動套用。", f"Preamp: {peq.get('preamp_db',0):.2f} dB", ""]
             for channel, filters in peq["filters"].items():
                 lines.append("Channel: " + ("L + R（同一組套用兩側）" if channel == "Shared" else channel))
                 for i, f in enumerate(filters):
@@ -891,7 +1049,7 @@ class Bridge(QObject):
             self._clear_candidates()
             self._explanation_cache = {}
             self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
-            self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
+            self._selected_peq_id = self._latest_peq_id()
             self._quality_cache = self._quality(self.project["measurements"])
             self._page = 0
             self._message = "已匯入獨立專案副本，所有版本已保留。"
