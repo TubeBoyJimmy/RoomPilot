@@ -1,0 +1,24 @@
+{
+  "retrieved_on": "2026-09-05",
+  "upstream": "Official Qt qtbase GitHub mirror",
+  "files": [
+    {
+      "file": "LGPL-3.0.txt",
+      "source": "https://raw.githubusercontent.com/qt/qtbase/dev/LICENSES/LGPL-3.0-only.txt",
+      "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+      "bytes": 7651
+    },
+    {
+      "file": "GPL-3.0.txt",
+      "source": "https://raw.githubusercontent.com/qt/qtbase/dev/LICENSES/GPL-3.0-only.txt",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "bytes": 35147
+    },
+    {
+      "file": "LGPL-2.1.txt",
+      "source": "https://raw.githubusercontent.com/qt/qtbase/dev/LICENSES/LGPL-2.1-or-later.txt",
+      "sha256": "1ccf09bf2f598308df4bed9cd8e9657dc5cd0973d2800318f2e241486e2edf3f",
+      "bytes": 25906
+    }
+  ]
+}
