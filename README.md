@@ -1,5 +1,7 @@
 # RoomPilot · 空間校正工作室
 
+原始碼版本與保存來源請見 [HISTORY.md](HISTORY.md)；`v0.1.0`～`v0.4.0` 標籤可用於比較歷次程式演進。
+
 RoomPilot 是在 Windows 本機使用的 REW 量測與 PEQ 專案工具。建立空間、直接匯入 `.mdat`、確認 Mic Cal 與量測品質，再產生可手動套用的 PEQ 建議，最後用補錄驗證結果。
 
 **一般 `.mdat V2` 匯入使用內建解析器，不需要開啟或安裝 REW，也不會在背景啟動 REW。** REW 用來錄製量測；RoomPilot 負責讀取、分析與保存專案。v0.4 的支援範圍與驗證限制請見 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)。
