@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 from functools import wraps
 import json
 import math
@@ -96,6 +97,10 @@ class Bridge(QObject):
         self._devices = {"inputs": [], "outputs": []}
         self._quality_cache = []
         self._gain_chart_cache = {}
+        self._explanation_cache = {}
+        self._candidate_comparison = {}
+        self._candidate_context = {}
+        self._candidate_key = ""
         self._closing = False
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(self.refreshDevices)
@@ -129,6 +134,54 @@ class Bridge(QObject):
 
     def _active_peqs(self):
         return [q for q in (self.project or {}).get("peqs", []) if not q.get("deleted_at")]
+
+    def _clear_candidates(self):
+        self._candidate_comparison = {}
+        self._candidate_context = {}
+        self._candidate_key = ""
+
+    def _candidate(self, key):
+        p = self._need_project()
+        context = self._candidate_context
+        if context.get("project_id") != p["id"] or context.get("baseline_version") != p.get("baseline_version"):
+            raise ValueError("候選所用的專案或 Baseline 已改變，請重新產生候選。")
+        item = next((c for c in self._candidate_comparison.get("candidates", []) if c["key"] == key), None)
+        if item is None:
+            raise ValueError("請先產生並選取一個候選方案。")
+        return item
+
+    def _no_candidate_preview(self):
+        if self._candidate_key:
+            raise ValueError("目前正在預覽未儲存候選；請先儲存此方案，或切回已儲存 PEQ。")
+
+    @staticmethod
+    def _fingerprint(value):
+        return hashlib.sha256(json.dumps(clean(value), sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _display_peq(self, peq):
+        """Add post-hoc explanations to old revisions without changing history."""
+        if not peq or peq.get("explanation") or self._page != 2:
+            return peq
+        if peq.get("id") in self._explanation_cache:
+            return {**peq, **self._explanation_cache[peq["id"]]}
+        extra = {}
+        try:
+            from .analysis import explain_peq, ALGORITHM_VERSION
+            baseline = self._baseline(peq.get("baseline_version"))
+            if baseline is None:
+                raise ValueError("找不到此方案的 Baseline 快照。")
+            explanation = clean(explain_peq(baseline["measurements"], peq.get("settings", {}), peq["filters"], peq["target_level"]))
+            explanation["post_hoc"] = True
+            explanation["evaluated_with_algorithm"] = ALGORITHM_VERSION
+            explanation["source_algorithm"] = peq.get("algorithm_version", "未記錄")
+            explanation.setdefault("notes", []).insert(0, "舊版補充說明：保留原參數與目標，以目前模型重新評估收益與代價；成本不是當初搜尋的歷史紀錄。")
+            extra = {"explanation": explanation}
+        except (ValueError, TypeError, KeyError, ImportError) as exc:
+            extra = {"explanation_error": "無法補充此舊版的模型說明：" + str(exc)}
+        if len(self._explanation_cache) >= 8:
+            self._explanation_cache.pop(next(iter(self._explanation_cache)))
+        self._explanation_cache[peq["id"]] = extra
+        return {**peq, **extra}
 
     def _peq(self, peq_id=None, include_deleted=False):
         p = self._need_project()
@@ -185,15 +238,24 @@ class Bridge(QObject):
         measurements = []
         curves = []
         project_summary = {}
+        candidate_preview = {}
         if project:
+            if self._candidate_context and (self._candidate_context.get("project_id") != project["id"] or self._candidate_context.get("baseline_version") != project.get("baseline_version")):
+                self._clear_candidates()
             measurements = [self._summary(m) for m in project["measurements"]]
             raw = next((m for m in project["measurements"] if m["id"] == self._selected_measurement_id), None)
             if raw:
                 selected = self._summary(raw)
                 curves = [{"name": raw["name"], "channel": raw["channel"], "kind": "measurement", "frequency": raw["frequency"], "spl": raw["spl"]}]
             peq = next((v for v in self._active_peqs() if v["id"] == self._selected_peq_id), {})
-            if self._page == 2 and peq:
-                curves = (peq.get("verification") or {}).get("curves") or peq.get("curves", [])
+            peq = self._display_peq(peq)
+            if self._candidate_key:
+                choice = self._candidate(self._candidate_key)
+                candidate_preview = {**choice["result"], "id": "draft:" + choice["key"], "name": choice["title"], "is_draft": True,
+                                     "status": "candidate", "baseline_version": self._candidate_context["baseline_version"], "verification": {}}
+            displayed = candidate_preview or peq
+            if self._page == 2 and displayed:
+                curves = (displayed.get("verification") or {}).get("curves") or displayed.get("curves", [])
             elif self._page == 0 and project.get("baseline_version"):
                 b = self._baseline()
                 curves = [{"name": m["name"], "channel": m["channel"], "kind": "baseline", "frequency": m["frequency"], "spl": m["spl"]} for m in b["measurements"] if m.get("position", "P0") == "P0"]
@@ -215,8 +277,8 @@ class Bridge(QObject):
                     c["spl"] = [values[int(i)] for i in indices]
             display_curves.append(c)
         f_max = 20000
-        if self._page == 2 and peq:
-            f_max = max(500, min(20000, peq.get("settings", {}).get("f_max", 200) * 2.5))
+        if self._page == 2 and (candidate_preview or peq):
+            f_max = max(500, min(20000, (candidate_preview or peq).get("settings", {}).get("f_max", 200) * 2.5))
         baseline_summaries = []
         for snapshot in (project or {}).get("baselines", []):
             summary = {key: copy.deepcopy(snapshot.get(key)) for key in ("version", "created_at", "settings", "quality", "warnings_acknowledged")}
@@ -224,6 +286,10 @@ class Bridge(QObject):
             baseline_summaries.append(summary)
         summaries = lambda qs: [{k: q.get(k) for k in ("id", "name", "created_at", "status", "baseline_version", "deleted_at")} for q in qs]
         self._state = clean({"projects": self.store.list_projects(), "project": project_summary, "measurements": measurements, "selected_measurement": selected, "baselines": baseline_summaries, "peqs": summaries(self._active_peqs()), "deleted_peqs": summaries([q for q in (project or {}).get("peqs", []) if q.get("deleted_at")]), "selected_peq": copy.deepcopy(peq), "quality": self._quality_cache, "history": (project or {}).get("history", []), "devices": self._devices, "busy": self._job is not None, "progress": self._progress, "message": self._message, "message_kind": self._message_kind, "page": self._page, "chart": {"curves": display_curves, "f_min": 20, "f_max": f_max}, "peq_chart": self._gain_chart(peq), "baseline_ready": bool(project and project.get("baseline_version"))})
+        self._state["candidate_comparison"] = clean(copy.deepcopy(self._candidate_comparison))
+        self._state["candidate_comparison"]["selected_key"] = self._candidate_key
+        self._state["candidate_preview"] = clean(candidate_preview)
+        self._state["peq_chart"] = clean(self._gain_chart(candidate_preview or peq))
         self.stateChanged.emit()
 
     @Slot(str, str)
@@ -231,6 +297,7 @@ class Bridge(QObject):
     def createProject(self, name, notes):
         self._not_busy()
         self.project = self.store.create(name, notes)
+        self._clear_candidates()
         self._selected_measurement_id = self._selected_peq_id = ""
         self._quality_cache = []
         self._page = 0
@@ -243,6 +310,8 @@ class Bridge(QObject):
     def selectProject(self, project_id):
         self._not_busy()
         self.project = self.store.load(project_id)
+        self._clear_candidates()
+        self._explanation_cache = {}
         self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
         self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
         self._quality_cache = self._quality(self.project["measurements"])
@@ -458,6 +527,7 @@ class Bridge(QObject):
             self._quality_cache = report
             raise ValueError("請先查看品質提醒，並勾選已確認提醒。缺少或無法讀取 Mic Cal 時，建議先在 REW 確認後另存匯入。")
         self.store.snapshot_baseline(p, ids, report, bool(acknowledged))
+        self._clear_candidates()
         self._message = f"Baseline v{p['baseline_version']} 已保存。接著設定可用的 PEQ 功能。"
         self._message_kind = "success"
         self._page = 2
@@ -467,6 +537,7 @@ class Bridge(QObject):
     @guarded
     def generatePeq(self, payload):
         self._not_busy()
+        self._no_candidate_preview()
         p = self._need_project()
         baseline = self._baseline()
         if not baseline:
@@ -483,6 +554,8 @@ class Bridge(QObject):
             base_peq = copy.deepcopy(self._peq())
             if base_peq["baseline_version"] != version:
                 raise ValueError("保留擴充需要目前 Baseline 的 PEQ；請選擇相同 Baseline 版本的方案。")
+
+        self._clear_candidates()
 
         def run(progress, cancel):
             from .analysis import generate_peq
@@ -516,10 +589,134 @@ class Bridge(QObject):
 
         self._start(run, complete, "正在比較低頻校正方案…")
 
+    @Slot(str, float)
+    @guarded
+    def generatePeqCandidates(self, payload, low_cut_limit_db=1.0):
+        self._not_busy()
+        p = self._need_project()
+        baseline = self._baseline()
+        if not baseline:
+            raise ValueError("請先設定 Baseline。")
+        settings = json.loads(payload)
+        if not isinstance(settings, dict):
+            raise ValueError("PEQ 設定格式錯誤。")
+        if not math.isfinite(low_cut_limit_db) or not 0 <= low_cut_limit_db <= 6:
+            raise ValueError("低處額外減益容許量需為 0–6 dB RMS。")
+        measurements = copy.deepcopy(baseline["measurements"])
+        version = baseline["version"]
+        settings["sample_rate"] = settings.get("sample_rate") or next((m.get("metadata", {}).get("sample_rate") for m in measurements if m.get("metadata", {}).get("sample_rate")), 48000)
+        base_peq = None
+        if settings.get("strategy") == "extend_existing":
+            self._no_candidate_preview()
+            base_peq = copy.deepcopy(self._peq())
+            if base_peq["baseline_version"] != version:
+                raise ValueError("保留擴充需要目前 Baseline 的已儲存方案。")
+        source_values = lambda q: {k: q.get(k) for k in ("filters", "settings", "target_level", "baseline_version")} if q else None
+        context = dict(project_id=p["id"], baseline_version=version, baseline_fingerprint=self._fingerprint(measurements),
+                       generation_settings=copy.deepcopy(settings), settings_fingerprint=self._fingerprint(settings),
+                       source_peq_id=(base_peq or {}).get("id"), source_fingerprint=self._fingerprint(source_values(base_peq)),
+                       replaces_peq_id=p.get("current_applied_peq_id", ""))
+        self._clear_candidates()
+        self._page = 2
+
+        def run(progress, cancel):
+            from .comparison import generate_peq_candidates
+            return generate_peq_candidates(measurements, settings, progress=progress, cancel=cancel,
+                                           base_peq=base_peq, low_cut_limit_db=low_cut_limit_db)
+
+        def complete(result):
+            if not self.project or self.project["id"] != context["project_id"] or self.project.get("baseline_version") != version:
+                raise ValueError("候選計算期間專案已改變，結果未保存。")
+            self._candidate_comparison = result
+            self._candidate_context = context
+            self._candidate_key = result.get("selected_key", "")
+            self._page = 2
+            self._message = "候選已完成，尚未新增 PEQ 版本。請比較收益與代價，選定後儲存。" if result.get("has_feasible_candidate") else "本輪候選均未符合額外減益容許量；可查看原因，或調整設定後重新比較。"
+            self._message_kind = "info" if result.get("has_feasible_candidate") else "warning"
+            self._refresh()
+
+        self._start(run, complete, "正在計算相同目標下的不同取捨…")
+
+    @Slot(str)
+    @guarded
+    def selectPeqCandidate(self, key):
+        self._not_busy()
+        candidate = self._candidate(key)
+        self._candidate_key = key
+        self._page = 2
+        self._message = "預覽 " + candidate["title"] + "；尚未保存為 PEQ。"
+        self._message_kind = "info" if candidate.get("within_limit") else "warning"
+        self._refresh()
+
+    @Slot()
+    @guarded
+    def discardPeqCandidates(self):
+        self._not_busy()
+        self._clear_candidates()
+        self._message = "候選預覽已關閉。"
+        self._message_kind = "info"
+        self._refresh()
+
+    @Slot(str)
+    @guarded
+    def savePeqCandidate(self, key):
+        self._not_busy()
+        candidate = self._candidate(key)
+        if not candidate.get("within_limit"):
+            raise ValueError("這個候選未符合設定的低處額外減益容許量；請調整設定後重新比較。")
+        p, context = self.project, self._candidate_context
+        baseline = self._baseline(context["baseline_version"])
+        if self._fingerprint(baseline["measurements"]) != context["baseline_fingerprint"]:
+            self._clear_candidates()
+            raise ValueError("Baseline 資料已改變，請重新產生候選。")
+        if context.get("source_peq_id"):
+            source = self._peq(context["source_peq_id"], include_deleted=True)
+            values = {k: source.get(k) for k in ("filters", "settings", "target_level", "baseline_version")}
+            if self._fingerprint(values) != context["source_fingerprint"]:
+                self._clear_candidates()
+                raise ValueError("擴充起點的參數已改變，請重新產生候選。")
+        result = copy.deepcopy(candidate["result"])
+        result["candidate_selection"] = {k: copy.deepcopy(v) for k, v in self._candidate_comparison.items() if k != "candidates"}
+        selection = result["candidate_selection"]
+        selection.update(selected_key=key, selected_title=candidate["title"], selected_at=timestamp(), baseline_version=context["baseline_version"],
+                         source_peq_id=context.get("source_peq_id"), baseline_fingerprint=context["baseline_fingerprint"],
+                         settings_fingerprint=context["settings_fingerprint"], historical=True)
+        selection["candidates"] = []
+        for item in self._candidate_comparison.get("candidates", []):
+            summary = {k: copy.deepcopy(v) for k, v in item.items() if k != "result"}
+            summary["result"] = {k: copy.deepcopy(item["result"].get(k)) for k in ("filters", "settings", "target_level", "algorithm_version")}
+            selection["candidates"].append(summary)
+        # Candidate-local keys never become durable PEQ references.
+        existing = next((q for q in reversed(self._active_peqs()) if q.get("baseline_version") == context["baseline_version"]
+                         and q.get("filters") == result["filters"] and q.get("settings") == result["settings"]
+                         and q.get("target_level") == result["target_level"] and q.get("algorithm_version") == result.get("algorithm_version")
+                         and (q.get("candidate_selection") or {}).get("low_cut_limit_db") == selection.get("low_cut_limit_db")
+                         and q.get("extension_source_id") == context.get("source_peq_id")), None)
+        if existing:
+            self._selected_peq_id = existing["id"]
+            self._candidate_key = ""
+            self._message = "這個候選已保存為 " + existing["name"] + "，已選取原版本。"
+            self._message_kind = "info"
+            self._refresh()
+            return
+        result.update(id=str(uuid.uuid4()), name=f"PEQ v{len(p['peqs'])+1}", created_at=timestamp(), status="draft",
+                      baseline_version=context["baseline_version"], replaces_peq_id=p.get("current_applied_peq_id", ""),
+                      extension_source_id=context.get("source_peq_id"), verification={}, verification_history=[])
+        p["peqs"].append(clean(result))
+        p["settings"]["peq_settings"] = copy.deepcopy(result["settings"])
+        p["settings"]["peq_low_cut_limit_db"] = selection["low_cut_limit_db"]
+        self._selected_peq_id = result["id"]
+        self._candidate_key = ""
+        self._page = 2
+        self._message = result["name"] + " 已保存，含候選比較與各段計算依據。這是完整替換設定。"
+        self._message_kind = "success"
+        self._save("保存 " + result["name"], candidate["title"] + f"；低處額外減益容許量 {selection['low_cut_limit_db']:g} dB RMS，尚需補錄驗證。")
+
     @Slot(str)
     @guarded
     def selectPeq(self, peq_id):
         self._peq(peq_id)
+        self._candidate_key = ""
         self._selected_peq_id = peq_id
         self._refresh()
 
@@ -545,6 +742,7 @@ class Bridge(QObject):
         if not peq.get("deleted_at"):
             raise ValueError("此方案不在回收區。")
         del peq["deleted_at"]
+        self._candidate_key = ""
         self._selected_peq_id = peq_id
         self._message = f"{peq['name']} 已還原。"
         self._message_kind = "success"
@@ -554,6 +752,7 @@ class Bridge(QObject):
     @guarded
     def editFilter(self, channel, index, frequency, gain, q, enabled):
         self._not_busy()
+        self._no_candidate_preview()
         p = self._need_project()
         original = self._peq()
         result = copy.deepcopy(original)
@@ -591,6 +790,7 @@ class Bridge(QObject):
     @guarded
     def markApplied(self, peq_id):
         self._not_busy()
+        self._no_candidate_preview()
         p = self._need_project()
         peq = self._peq(peq_id)
         peq["status"] = "applied"
@@ -613,6 +813,7 @@ class Bridge(QObject):
 
     def _compare_verification(self, peq_id, allow_mismatch):
         self._not_busy()
+        self._no_candidate_preview()
         p = self._need_project()
         peq = self._peq(peq_id)
         if peq["status"] != "applied":
@@ -687,6 +888,8 @@ class Bridge(QObject):
         path, _ = QFileDialog.getOpenFileName(None, "匯入可攜專案", "", "RoomPilot 專案 (*.roompilot)")
         if path:
             self.project = self.store.import_bundle(path)
+            self._clear_candidates()
+            self._explanation_cache = {}
             self._selected_measurement_id = self.project["measurements"][0]["id"] if self.project["measurements"] else ""
             self._selected_peq_id = self._active_peqs()[-1]["id"] if self._active_peqs() else ""
             self._quality_cache = self._quality(self.project["measurements"])
